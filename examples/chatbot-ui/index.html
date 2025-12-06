@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NDX PRO AI Chatbot Test</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <h1>NDX PRO AI Chatbot Test</h1>
+            <div class="connection-status" id="connectionStatus">
+                <span class="status-dot"></span>
+                <span class="status-text">연결 안됨</span>
+            </div>
+        </header>
+
+        <div class="settings">
+            <div class="setting-row">
+                <label for="serverUrl">Server:</label>
+                <input type="text" id="serverUrl" value="localhost:58080" placeholder="localhost:58080">
+                <button id="connectBtn" class="btn btn-primary">연결</button>
+            </div>
+            <div class="setting-row">
+                <label>Session:</label>
+                <span id="sessionId" class="session-id">-</span>
+                <button id="newSessionBtn" class="btn btn-secondary">새 세션</button>
+                <button id="clearHistoryBtn" class="btn btn-secondary">초기화</button>
+            </div>
+            <div class="setting-row">
+                <label for="systemPrompt">System Prompt:</label>
+                <input type="text" id="systemPrompt" placeholder="You are a helpful assistant...">
+            </div>
+        </div>
+
+        <div class="chat-container" id="chatContainer">
+            <div class="messages" id="messages">
+                <div class="welcome-message">
+                    서버에 연결하고 대화를 시작하세요.
+                </div>
+            </div>
+        </div>
+
+        <div class="input-container">
+            <textarea
+                id="messageInput"
+                placeholder="메시지를 입력하세요... (Enter로 전송, Shift+Enter로 줄바꿈)"
+                rows="1"
+                disabled
+            ></textarea>
+            <button id="sendBtn" class="btn btn-primary" disabled>전송</button>
+        </div>
+    </div>
+
+    <div class="toast-container" id="toastContainer"></div>
+
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
