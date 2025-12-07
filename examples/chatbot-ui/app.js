@@ -5,6 +5,7 @@ class ChatApp {
         this.socket = null;
         this.isStreaming = false;
         this.currentBotMessage = null;
+        this.debugMode = false;
 
         this.initElements();
         this.initEventListeners();
@@ -22,6 +23,13 @@ class ChatApp {
         this.sendBtn = document.getElementById('sendBtn');
         this.connectionStatus = document.getElementById('connectionStatus');
         this.toastContainer = document.getElementById('toastContainer');
+
+        // Debug mode elements
+        this.debugModeToggle = document.getElementById('debugMode');
+        this.debugModeLabel = document.getElementById('debugModeLabel');
+        this.debugPanel = document.getElementById('debugPanel');
+        this.debugContent = document.getElementById('debugContent');
+        this.clearDebugBtn = document.getElementById('clearDebugBtn');
     }
 
     initEventListeners() {
@@ -40,6 +48,19 @@ class ChatApp {
         this.messageInput.addEventListener('input', () => {
             this.messageInput.style.height = 'auto';
             this.messageInput.style.height = Math.min(this.messageInput.scrollHeight, 120) + 'px';
+        });
+
+        // Debug mode toggle
+        this.debugModeToggle.addEventListener('change', () => {
+            this.debugMode = this.debugModeToggle.checked;
+            this.debugModeLabel.textContent = this.debugMode ? 'ON' : 'OFF';
+            this.debugModeLabel.classList.toggle('active', this.debugMode);
+            this.debugPanel.style.display = this.debugMode ? 'flex' : 'none';
+        });
+
+        // Clear debug log
+        this.clearDebugBtn.addEventListener('click', () => {
+            this.clearDebugLog();
         });
     }
 
@@ -91,6 +112,7 @@ class ChatApp {
         }
 
         this.clearMessages();
+        this.clearDebugLog();
 
         try {
             await this.createSession();
@@ -114,7 +136,6 @@ class ChatApp {
 
         this.socket.on('connect', () => {
             console.log('Socket.IO connected, joining session:', this.sessionId);
-            // Send join event with session_id after connection
             this.socket.emit('join', { session_id: this.sessionId });
         });
 
@@ -154,6 +175,23 @@ class ChatApp {
             this.clearMessages();
             this.showToast('대화 내역이 초기화되었습니다', 'success');
         });
+
+        // Debug event listeners
+        this.socket.on('debug:step', (data) => {
+            this.handleDebugStep(data);
+        });
+
+        this.socket.on('debug:plan', (data) => {
+            this.handleDebugPlan(data);
+        });
+
+        this.socket.on('debug:query', (data) => {
+            this.handleDebugQuery(data);
+        });
+
+        this.socket.on('debug:retrieval', (data) => {
+            this.handleDebugRetrieval(data);
+        });
     }
 
     handleChunk(payload) {
@@ -185,6 +223,118 @@ class ChatApp {
         this.showToast(`오류: ${payload.message}`, 'error');
     }
 
+    // Debug event handlers
+    handleDebugStep(data) {
+        const statusClass = data.status || '';
+        const statusText = data.status === 'started' ? '시작' :
+                          data.status === 'completed' ? '완료' :
+                          data.status === 'error' ? '오류' : data.status;
+
+        let detailsHtml = '';
+        if (data.duration_ms) {
+            detailsHtml += `<div class="detail-item"><span class="detail-key">소요시간:</span> <span class="detail-value">${data.duration_ms}ms</span></div>`;
+        }
+        if (data.input && Object.keys(data.input).length > 0) {
+            detailsHtml += `<div class="detail-item"><span class="detail-key">입력:</span> <span class="detail-value">${JSON.stringify(data.input).substring(0, 100)}</span></div>`;
+        }
+        if (data.output && Object.keys(data.output).length > 0) {
+            detailsHtml += `<div class="detail-item"><span class="detail-key">출력:</span> <span class="detail-value">${JSON.stringify(data.output).substring(0, 100)}</span></div>`;
+        }
+
+        this.addDebugEntry('step', `${data.step_name} - ${statusText}`, detailsHtml, statusClass);
+    }
+
+    handleDebugPlan(data) {
+        let content = `상태: ${data.status}`;
+        if (data.objective) {
+            content = `목표: ${data.objective}`;
+        }
+
+        let detailsHtml = '';
+        if (data.steps && data.steps.length > 0) {
+            detailsHtml = '<div class="plan-steps">';
+            data.steps.forEach((step, index) => {
+                const indexClass = index === data.current_step ? 'current' :
+                                  (data.status === 'completed' ? 'completed' : '');
+                detailsHtml += `
+                    <div class="plan-step">
+                        <span class="plan-step-index ${indexClass}">${index + 1}</span>
+                        <span>${step}</span>
+                    </div>`;
+            });
+            detailsHtml += '</div>';
+        }
+
+        this.addDebugEntry('plan', content, detailsHtml);
+    }
+
+    handleDebugQuery(data) {
+        const content = `원본 쿼리: "${data.original_query}"`;
+
+        let detailsHtml = '<div class="query-list">';
+        detailsHtml += `<div class="query-item original">→ ${data.original_query}</div>`;
+
+        if (data.rewritten_queries && data.rewritten_queries.length > 0) {
+            data.rewritten_queries.forEach((query, index) => {
+                if (query !== data.original_query) {
+                    detailsHtml += `<div class="query-item rewritten">→ ${query}</div>`;
+                }
+            });
+        }
+        detailsHtml += '</div>';
+
+        this.addDebugEntry('query', `쿼리 리라이팅 (${data.rewritten_queries?.length || 1}개)`, detailsHtml);
+    }
+
+    handleDebugRetrieval(data) {
+        const content = `쿼리 #${data.query_index + 1}: ${data.document_count}개 문서 검색 (${data.duration_ms}ms)`;
+
+        let detailsHtml = '';
+        if (data.documents && data.documents.length > 0) {
+            detailsHtml = '<div class="debug-details">';
+            data.documents.forEach((doc, index) => {
+                const score = doc.score ? ` (${(doc.score * 100).toFixed(1)}%)` : '';
+                detailsHtml += `<div class="detail-item"><span class="detail-key">[${doc.id}]${score}</span> ${doc.content.substring(0, 80)}...</div>`;
+            });
+            detailsHtml += '</div>';
+        }
+
+        this.addDebugEntry('retrieval', content, detailsHtml);
+    }
+
+    addDebugEntry(type, content, detailsHtml = '', statusClass = '') {
+        const timestamp = new Date().toLocaleTimeString('ko-KR', {
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: false
+        });
+
+        const entry = document.createElement('div');
+        entry.className = `debug-entry ${type} ${statusClass}`;
+
+        const typeLabel = {
+            'step': 'STEP',
+            'plan': 'PLAN',
+            'query': 'QUERY',
+            'retrieval': 'RETRIEVAL'
+        }[type] || type.toUpperCase();
+
+        entry.innerHTML = `
+            <span class="debug-timestamp">${timestamp}</span>
+            <span class="debug-type ${type}">[${typeLabel}]</span>
+            <span class="debug-content-text">${content}</span>
+            ${detailsHtml}
+        `;
+
+        this.debugContent.appendChild(entry);
+        this.debugContent.scrollTop = this.debugContent.scrollHeight;
+    }
+
+    clearDebugLog() {
+        this.debugContent.innerHTML = '';
+    }
+
     sendMessage() {
         const content = this.messageInput.value.trim();
         if (!content || !this.socket || !this.socket.connected || this.isStreaming) {
@@ -195,7 +345,16 @@ class ChatApp {
         this.messageInput.value = '';
         this.messageInput.style.height = 'auto';
 
-        this.socket.emit('chat', { content });
+        // Clear debug log for new message
+        if (this.debugMode) {
+            this.clearDebugLog();
+        }
+
+        // Send with debug flag
+        this.socket.emit('chat', {
+            content,
+            debug: this.debugMode
+        });
 
         this.enableInput(false);
     }

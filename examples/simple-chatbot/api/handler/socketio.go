@@ -18,9 +18,9 @@ import (
 )
 
 type SocketIOHandler struct {
-	io           *socketio.Io
-	sessionStore *service.SessionStore
-	chatService  *service.ChatService
+	io             *socketio.Io
+	sessionStore   *service.SessionStore
+	chatService    *service.ChatService
 	socketSessions sync.Map // socketId -> sessionId
 }
 
@@ -147,10 +147,29 @@ func (h *SocketIOHandler) handleChat(socket *socketio.Socket, event *socketio.Ev
 		return
 	}
 
+	// Check if debug mode is enabled
+	debugMode := false
+	if debug, ok := data["debug"].(bool); ok {
+		debugMode = debug
+	}
+
 	ctx := context.Background()
 	messageID := uuid.New().String()
 
-	streamReader, err := h.chatService.ChatStream(ctx, sessionID, content)
+	var streamReader *schema.StreamReader[*schema.Message]
+	var err error
+
+	if debugMode {
+		// Create debug emitter that sends events to the socket
+		emitter := func(event string, eventData interface{}) {
+			socket.Emit(event, eventData)
+		}
+
+		streamReader, err = h.chatService.ChatStreamWithDebug(ctx, sessionID, content, emitter)
+	} else {
+		streamReader, err = h.chatService.ChatStream(ctx, sessionID, content)
+	}
+
 	if err != nil {
 		socket.Emit("error", map[string]string{
 			"code":    "CHAT_ERROR",
