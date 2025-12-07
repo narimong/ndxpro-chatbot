@@ -32,6 +32,23 @@
                 <label for="systemPrompt">System Prompt:</label>
                 <input type="text" id="systemPrompt" placeholder="You are a helpful assistant...">
             </div>
+            <div class="setting-row">
+                <label for="debugMode">Debug Mode:</label>
+                <label class="toggle-switch">
+                    <input type="checkbox" id="debugMode">
+                    <span class="toggle-slider"></span>
+                </label>
+                <span id="debugModeLabel" class="debug-mode-label">OFF</span>
+            </div>
+        </div>
+
+        <!-- Debug Panel -->
+        <div class="debug-panel" id="debugPanel" style="display: none;">
+            <div class="debug-header">
+                <h3>Debug Panel</h3>
+                <button id="clearDebugBtn" class="btn btn-secondary btn-small">Clear</button>
+            </div>
+            <div class="debug-content" id="debugContent"></div>
         </div>
 
         <div class="chat-container" id="chatContainer">
