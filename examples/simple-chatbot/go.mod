@@ -8,6 +8,7 @@ require (
 	github.com/doquangtan/socket.io/v4 v4.0.11
 	github.com/gin-gonic/gin v1.10.0
 	github.com/google/uuid v1.6.0
+	github.com/neo4j/neo4j-go-driver/v5 v5.27.0
 )
 
 require (

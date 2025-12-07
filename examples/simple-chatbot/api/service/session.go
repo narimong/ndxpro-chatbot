@@ -101,3 +101,43 @@ func (s *SessionStore) List() []*model.Session {
 	}
 	return sessions
 }
+
+// SetPendingClarification sets the pending clarification for a session
+func (s *SessionStore) SetPendingClarification(id string, pending *model.PendingClarification) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	session, ok := s.sessions[id]
+	if !ok {
+		return ErrSessionNotFound
+	}
+	session.PendingClarification = pending
+	session.LastActivity = time.Now()
+	return nil
+}
+
+// ClearPendingClarification clears the pending clarification for a session
+func (s *SessionStore) ClearPendingClarification(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	session, ok := s.sessions[id]
+	if !ok {
+		return ErrSessionNotFound
+	}
+	session.PendingClarification = nil
+	session.LastActivity = time.Now()
+	return nil
+}
+
+// GetPendingClarification gets the pending clarification for a session
+func (s *SessionStore) GetPendingClarification(id string) (*model.PendingClarification, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	session, ok := s.sessions[id]
+	if !ok {
+		return nil, ErrSessionNotFound
+	}
+	return session.PendingClarification, nil
+}

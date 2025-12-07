@@ -2,10 +2,14 @@ package model
 
 // Debug event types for Socket.IO
 const (
-	EventDebugStep      = "debug:step"      // Component execution start/end
-	EventDebugPlan      = "debug:plan"      // Planning information
-	EventDebugQuery     = "debug:query"     // Query decomposition/rewriting
-	EventDebugRetrieval = "debug:retrieval" // Retrieval results
+	EventDebugStep          = "debug:step"          // Component execution start/end
+	EventDebugPlan          = "debug:plan"          // Planning information
+	EventDebugQuery         = "debug:query"         // Query decomposition/rewriting
+	EventDebugRetrieval     = "debug:retrieval"     // Retrieval results
+	EventDebugShortestPath  = "debug:shortest_path" // Shortest path navigation
+	EventClarificationReq   = "clarification:request"  // Clarification needed
+	EventClarificationResp  = "clarification:response" // User response to clarification
+	EventClarificationDone  = "clarification:resolved" // Clarification resolved
 )
 
 // DebugStepPayload represents a step execution event
@@ -65,10 +69,55 @@ const (
 
 // Component constants
 const (
-	ComponentModel        = "model"
-	ComponentRetriever    = "retriever"
-	ComponentPrompt       = "prompt"
-	ComponentPlanner      = "planner"
+	ComponentModel         = "model"
+	ComponentRetriever     = "retriever"
+	ComponentPrompt        = "prompt"
+	ComponentPlanner       = "planner"
 	ComponentQueryRewriter = "query_rewriter"
-	ComponentFusion       = "fusion"
+	ComponentFusion        = "fusion"
+	ComponentShortestPath  = "shortest_path"
+	ComponentClarification = "clarification"
 )
+
+// ClarificationRequestPayload represents a clarification request to the user
+type ClarificationRequestPayload struct {
+	RequestID       string                `json:"request_id"`
+	OriginalQuery   string                `json:"original_query"`
+	Reason          string                `json:"reason"`
+	Options         []ClarificationOption `json:"options"`
+	AllowFreeText   bool                  `json:"allow_free_text"`
+	ReachableLabels []string              `json:"reachable_labels,omitempty"`
+	Timestamp       int64                 `json:"timestamp"`
+}
+
+// ClarificationOption represents an option for clarification
+type ClarificationOption struct {
+	ID          string `json:"id"`
+	Label       string `json:"label"`
+	Description string `json:"description"`
+	TargetLabel string `json:"target_label"`
+}
+
+// ClarificationResponsePayload represents the user's response to clarification
+type ClarificationResponsePayload struct {
+	RequestID  string `json:"request_id"`
+	SelectedID string `json:"selected_id,omitempty"`
+	FreeText   string `json:"free_text,omitempty"`
+	Timestamp  int64  `json:"timestamp"`
+}
+
+// ShortestPathPayload represents a shortest path navigation event
+type ShortestPathPayload struct {
+	SourceNode  string     `json:"source_node"`
+	TargetLabel string     `json:"target_label"`
+	PathsFound  int        `json:"paths_found"`
+	Paths       []PathInfo `json:"paths,omitempty"`
+	Timestamp   int64      `json:"timestamp"`
+}
+
+// PathInfo represents a single path result
+type PathInfo struct {
+	PathChain  string `json:"path_chain"`
+	Hops       int    `json:"hops"`
+	TargetName string `json:"target_name"`
+}
