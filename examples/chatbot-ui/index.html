@@ -16,57 +16,102 @@
             </div>
         </header>
 
-        <div class="settings">
-            <div class="setting-row">
-                <label for="serverUrl">Server:</label>
-                <input type="text" id="serverUrl" value="localhost:58080" placeholder="localhost:58080">
-                <button id="connectBtn" class="btn btn-primary">연결</button>
-            </div>
-            <div class="setting-row">
-                <label>Session:</label>
-                <span id="sessionId" class="session-id">-</span>
-                <button id="newSessionBtn" class="btn btn-secondary">새 세션</button>
-                <button id="clearHistoryBtn" class="btn btn-secondary">초기화</button>
-            </div>
-            <div class="setting-row">
-                <label for="systemPrompt">System Prompt:</label>
-                <input type="text" id="systemPrompt" placeholder="You are a helpful assistant...">
-            </div>
-            <div class="setting-row">
-                <label for="debugMode">Debug Mode:</label>
-                <label class="toggle-switch">
-                    <input type="checkbox" id="debugMode">
-                    <span class="toggle-slider"></span>
-                </label>
-                <span id="debugModeLabel" class="debug-mode-label">OFF</span>
-            </div>
-        </div>
+        <div class="main-content">
+            <!-- Left Panel: Settings, Debug, Viz -->
+            <div class="left-panel">
+                <div class="settings">
+                    <div class="setting-row">
+                        <label for="serverUrl">Server:</label>
+                        <input type="text" id="serverUrl" value="localhost:58080" placeholder="localhost:58080">
+                        <button id="connectBtn" class="btn btn-primary">연결</button>
+                    </div>
+                    <div class="setting-row">
+                        <label>Session:</label>
+                        <span id="sessionId" class="session-id">-</span>
+                        <button id="newSessionBtn" class="btn btn-secondary">새 세션</button>
+                        <button id="clearHistoryBtn" class="btn btn-secondary">초기화</button>
+                    </div>
+                    <div class="setting-row">
+                        <label for="systemPrompt">System Prompt:</label>
+                        <input type="text" id="systemPrompt" placeholder="You are a helpful assistant...">
+                    </div>
+                    <div class="setting-row toggles-row">
+                        <div class="toggle-group">
+                            <label for="debugMode">Debug:</label>
+                            <label class="toggle-switch">
+                                <input type="checkbox" id="debugMode">
+                                <span class="toggle-slider"></span>
+                            </label>
+                            <span id="debugModeLabel" class="toggle-label">OFF</span>
+                        </div>
+                        <div class="toggle-group">
+                            <label for="vizMode">Viz:</label>
+                            <label class="toggle-switch">
+                                <input type="checkbox" id="vizMode" checked>
+                                <span class="toggle-slider"></span>
+                            </label>
+                            <span id="vizModeLabel" class="toggle-label">ON</span>
+                        </div>
+                    </div>
+                </div>
 
-        <!-- Debug Panel -->
-        <div class="debug-panel" id="debugPanel" style="display: none;">
-            <div class="debug-header">
-                <h3>Debug Panel</h3>
-                <button id="clearDebugBtn" class="btn btn-secondary btn-small">Clear</button>
-            </div>
-            <div class="debug-content" id="debugContent"></div>
-        </div>
+                <!-- Debug Panel -->
+                <div class="debug-panel" id="debugPanel" style="display: none;">
+                    <div class="debug-header">
+                        <h3>Debug Panel</h3>
+                        <button id="clearDebugBtn" class="btn btn-secondary btn-small">Clear</button>
+                    </div>
+                    <div class="debug-content" id="debugContent"></div>
+                </div>
 
-        <div class="chat-container" id="chatContainer">
-            <div class="messages" id="messages">
-                <div class="welcome-message">
-                    서버에 연결하고 대화를 시작하세요.
+                <!-- Viz Panel (NEW) -->
+                <div class="viz-panel" id="vizPanel">
+                    <div class="viz-header">
+                        <h3>Visualization</h3>
+                        <button id="clearVizBtn" class="btn btn-secondary btn-small">Clear</button>
+                    </div>
+                    <div class="viz-stats">
+                        <div class="viz-stat">
+                            <span class="stat-label">Nodes</span>
+                            <span class="stat-value" id="vizNodeCount">0</span>
+                        </div>
+                        <div class="viz-stat">
+                            <span class="stat-label">Edges</span>
+                            <span class="stat-value" id="vizEdgeCount">0</span>
+                        </div>
+                        <div class="viz-stat">
+                            <span class="stat-label">Queries</span>
+                            <span class="stat-value" id="vizQueryCount">0</span>
+                        </div>
+                    </div>
+                    <div class="viz-events" id="vizEvents">
+                        <div class="viz-placeholder">
+                            No visualization events yet. Send a message to start.
+                        </div>
+                    </div>
                 </div>
             </div>
-        </div>
 
-        <div class="input-container">
-            <textarea
-                id="messageInput"
-                placeholder="메시지를 입력하세요... (Enter로 전송, Shift+Enter로 줄바꿈)"
-                rows="1"
-                disabled
-            ></textarea>
-            <button id="sendBtn" class="btn btn-primary" disabled>전송</button>
+            <!-- Right Panel: Chat -->
+            <div class="right-panel">
+                <div class="chat-container" id="chatContainer">
+                    <div class="messages" id="messages">
+                        <div class="welcome-message">
+                            서버에 연결하고 대화를 시작하세요.
+                        </div>
+                    </div>
+                </div>
+
+                <div class="input-container">
+                    <textarea
+                        id="messageInput"
+                        placeholder="메시지를 입력하세요... (Enter로 전송, Shift+Enter로 줄바꿈)"
+                        rows="1"
+                        disabled
+                    ></textarea>
+                    <button id="sendBtn" class="btn btn-primary" disabled>전송</button>
+                </div>
+            </div>
         </div>
     </div>
 

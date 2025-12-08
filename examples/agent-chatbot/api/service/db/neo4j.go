@@ -11,6 +11,9 @@ import (
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
 )
 
+// QueryLoggerFunc is a callback for logging executed Cypher queries
+type QueryLoggerFunc func(cypher string, params map[string]any, resultCount int, duration time.Duration, source string)
+
 // Neo4jClient wraps the Neo4j driver for graph database operations
 type Neo4jClient struct {
 	driver        neo4j.DriverWithContext
@@ -25,6 +28,10 @@ type Neo4jClient struct {
 	// Dynamic label groups cache
 	dynamicLabelGroups map[string][]string
 	labelGroupsMutex   sync.RWMutex
+
+	// Query logger for visualization
+	queryLogger QueryLoggerFunc
+	loggerMutex sync.RWMutex
 }
 
 // PathResult represents a shortest path result with linearized path chain
@@ -69,8 +76,36 @@ func (c *Neo4jClient) Close(ctx context.Context) error {
 	return c.driver.Close(ctx)
 }
 
+// SetQueryLogger sets a callback for logging executed Cypher queries
+func (c *Neo4jClient) SetQueryLogger(logger QueryLoggerFunc) {
+	c.loggerMutex.Lock()
+	defer c.loggerMutex.Unlock()
+	c.queryLogger = logger
+}
+
+// ClearQueryLogger removes the query logger
+func (c *Neo4jClient) ClearQueryLogger() {
+	c.loggerMutex.Lock()
+	defer c.loggerMutex.Unlock()
+	c.queryLogger = nil
+}
+
+// getQueryLogger returns the current query logger (thread-safe)
+func (c *Neo4jClient) getQueryLogger() QueryLoggerFunc {
+	c.loggerMutex.RLock()
+	defer c.loggerMutex.RUnlock()
+	return c.queryLogger
+}
+
 // ExecuteQuery executes a Cypher query and returns the results as a slice of maps
 func (c *Neo4jClient) ExecuteQuery(ctx context.Context, cypher string, params map[string]any) ([]map[string]any, error) {
+	return c.ExecuteQueryWithSource(ctx, cypher, params, "ExecuteQuery")
+}
+
+// ExecuteQueryWithSource executes a Cypher query with source tracking for visualization
+func (c *Neo4jClient) ExecuteQueryWithSource(ctx context.Context, cypher string, params map[string]any, source string) ([]map[string]any, error) {
+	startTime := time.Now()
+
 	session := c.driver.NewSession(ctx, neo4j.SessionConfig{})
 	defer session.Close(ctx)
 
@@ -87,6 +122,12 @@ func (c *Neo4jClient) ExecuteQuery(ctx context.Context, cypher string, params ma
 
 	if err := result.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating results: %w", err)
+	}
+
+	// Log query if logger is set
+	if logger := c.getQueryLogger(); logger != nil {
+		duration := time.Since(startTime)
+		logger(cypher, params, len(records), duration, source)
 	}
 
 	return records, nil

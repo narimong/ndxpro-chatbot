@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 
 	"agent-chatbot/api/service/db"
@@ -105,6 +106,7 @@ Vehicle, CompetitorVehicle, Manufacturer, Engine, PerformanceTotalScore 등
 func (t *GraphSearchTool) InvokableRun(ctx context.Context, argumentsInJSON string, opts ...tool.Option) (string, error) {
 	var input GraphSearchInput
 	if err := json.Unmarshal([]byte(argumentsInJSON), &input); err != nil {
+		log.Printf("[DEBUG] GraphSearchTool: parse error: %v", err)
 		return t.errorResponse("인자 파싱 실패: " + err.Error())
 	}
 
@@ -115,6 +117,10 @@ func (t *GraphSearchTool) InvokableRun(ctx context.Context, argumentsInJSON stri
 	if input.Strategy == "" {
 		input.Strategy = "exact"
 	}
+
+	// Debug logging for query tracking
+	log.Printf("[DEBUG] GraphSearchTool: query=%q, strategy=%s, labelHint=%q, topK=%d",
+		input.Query, input.Strategy, input.LabelHint, input.TopK)
 
 	// Execute search based on strategy
 	var candidates []serviceTools.NodeCandidate
@@ -139,7 +145,17 @@ func (t *GraphSearchTool) InvokableRun(ctx context.Context, argumentsInJSON stri
 	}
 
 	if err != nil {
+		log.Printf("[DEBUG] GraphSearchTool: search error: %v", err)
 		return t.errorResponse(fmt.Sprintf("검색 실패: %v", err))
+	}
+
+	// Log search results
+	log.Printf("[DEBUG] GraphSearchTool: found %d candidates for query=%q", len(candidates), input.Query)
+	for i, c := range candidates {
+		if i < 3 { // Log first 3 results
+			log.Printf("[DEBUG] GraphSearchTool: result[%d] name=%q, labels=%v, score=%.3f",
+				i, c.Name, c.Labels, c.Score)
+		}
 	}
 
 	// Build output

@@ -4,14 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
+	"time"
 
+	apimodel "agent-chatbot/api/model"
 	"agent-chatbot/api/service/db"
 	"agent-chatbot/api/service/tools"
 
 	einoModel "github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/retriever"
 	"github.com/cloudwego/eino/schema"
+	"github.com/google/uuid"
 )
 
 // DebugEventType represents the type of debug event
@@ -784,6 +788,89 @@ func (r *GraphRAGRetriever) emitDebug(event DebugEvent) {
 	}
 }
 
+// SetDebugEmitter sets the debug emitter for this retriever and propagates to sub-components
+func (r *GraphRAGRetriever) SetDebugEmitter(emitter DebugEmitter) {
+	r.debugEmitter = emitter
+	// Propagate to conditional retriever
+	if r.conditionalRetriever != nil {
+		r.conditionalRetriever.SetDebugEmitter(emitter)
+	}
+}
+
+// emitVizForLabelListing emits viz events for label listing query results
+func (r *GraphRAGRetriever) emitVizForLabelListing(label string, results []map[string]any, total int, duration time.Duration) {
+	if r.debugEmitter == nil {
+		return
+	}
+
+	var vizNodes []apimodel.VizNode
+
+	// Emit viz:cypher for the label listing query
+	cypherViz := apimodel.VizCypher{
+		QueryID:     uuid.New().String(),
+		Cypher:      fmt.Sprintf("MATCH (n:%s) RETURN n ORDER BY n.name LIMIT %d", label, len(results)),
+		Params:      map[string]any{"label": label},
+		ResultCount: len(results),
+		Duration:    duration.Milliseconds(),
+		Source:      "graph_rag_retriever.LabelListing",
+		Timestamp:   time.Now().UnixMilli(),
+	}
+	log.Printf("[VIZ] Emitting viz:cypher (label listing): MATCH (n:%s) duration=%dms results=%d", label, duration.Milliseconds(), len(results))
+	r.debugEmitter(apimodel.EventVizCypher, cypherViz)
+
+	// Emit viz:node for each result
+	for i, node := range results {
+		nodeUUID := ""
+		nodeName := ""
+		nodeLabels := []string{label}
+
+		if u, ok := node["uuid"].(string); ok {
+			nodeUUID = u
+		}
+		if n, ok := node["name"].(string); ok {
+			nodeName = n
+		}
+		if l, ok := node["labels"].([]any); ok {
+			nodeLabels = make([]string, 0, len(l))
+			for _, lbl := range l {
+				if s, ok := lbl.(string); ok {
+					nodeLabels = append(nodeLabels, s)
+				}
+			}
+		}
+
+		vizNode := apimodel.VizNode{
+			UUID:   nodeUUID,
+			Name:   nodeName,
+			Labels: nodeLabels,
+			Depth:  0,
+			Source: "label_listing",
+		}
+		log.Printf("[VIZ] Emitting viz:node (label listing %d): %s", i+1, nodeName)
+		r.debugEmitter(apimodel.EventVizNode, vizNode)
+		vizNodes = append(vizNodes, vizNode)
+	}
+
+	// Emit viz:complete
+	vizComplete := apimodel.VizCompletePayload{
+		Nodes:         vizNodes,
+		Edges:         []apimodel.VizEdge{},
+		CypherQueries: []apimodel.VizCypher{cypherViz},
+		AnswerNodeIDs: func() []string {
+			ids := make([]string, 0, len(results))
+			for _, node := range results {
+				if u, ok := node["uuid"].(string); ok {
+					ids = append(ids, u)
+				}
+			}
+			return ids
+		}(),
+		Timestamp: time.Now().UnixMilli(),
+	}
+	log.Printf("[VIZ] Emitting viz:complete (label listing): %d nodes for label %s", len(vizNodes), label)
+	r.debugEmitter(apimodel.EventVizComplete, vizComplete)
+}
+
 // GetType returns the retriever type
 func (r *GraphRAGRetriever) GetType() string {
 	return "GraphRAGRetriever"
@@ -1353,7 +1440,7 @@ func (r *GraphRAGRetriever) hierarchyToDocument(
 		}
 		content.WriteString("\n")
 
-		// Add detailed breakdown for each category
+		// Add detailed breakdown for each category (recursive to handle all depths)
 		for _, child := range hierarchy.Children {
 			if len(child.Children) > 0 {
 				childValue := r.getPropertyValue(child.Properties, "value", "")
@@ -1364,22 +1451,8 @@ func (r *GraphRAGRetriever) hierarchyToDocument(
 					content.WriteString(fmt.Sprintf("### %s 세부\n", child.Name))
 				}
 
-				// Group items in rows of 3 for readability
-				items := make([]string, 0)
-				for _, grandchild := range child.Children {
-					gcValue := r.getPropertyValue(grandchild.Properties, "value", "-")
-					gcMax := r.getPropertyValue(grandchild.Properties, "최대 점수", "-")
-					items = append(items, fmt.Sprintf("%s: %v/%v", grandchild.Name, gcValue, gcMax))
-				}
-
-				// Write items, 3 per line
-				for i := 0; i < len(items); i += 3 {
-					end := i + 3
-					if end > len(items) {
-						end = len(items)
-					}
-					content.WriteString("- " + strings.Join(items[i:end], " | ") + "\n")
-				}
+				// Recursively render all grandchildren (depth 2+)
+				r.renderChildrenRecursive(&content, child.Children, 0)
 				content.WriteString("\n")
 			}
 		}
@@ -1407,6 +1480,41 @@ func (r *GraphRAGRetriever) hierarchyToDocument(
 			"children_count": len(hierarchy.Children),
 			"source":        "graph_rag_hierarchy",
 		},
+	}
+}
+
+// renderChildrenRecursive recursively renders hierarchical children to markdown
+// depth controls indentation level (0 = no indent, 1 = one level, etc.)
+func (r *GraphRAGRetriever) renderChildrenRecursive(
+	content *strings.Builder,
+	children []*db.HierarchicalNode,
+	depth int,
+) {
+	if len(children) == 0 {
+		return
+	}
+
+	// Create indent based on depth
+	indent := strings.Repeat("  ", depth)
+
+	for _, child := range children {
+		value := r.getPropertyValue(child.Properties, "value", "-")
+		maxScore := r.getPropertyValue(child.Properties, "최대 점수", "-")
+		ratio := r.calculateRatio(value, maxScore)
+
+		// Format the line with score information
+		if ratio > 0 {
+			content.WriteString(fmt.Sprintf("%s- %s: %v/%v (%.1f%%)\n",
+				indent, child.Name, value, maxScore, ratio))
+		} else {
+			content.WriteString(fmt.Sprintf("%s- %s: %v/%v\n",
+				indent, child.Name, value, maxScore))
+		}
+
+		// Recursively render children if they exist
+		if len(child.Children) > 0 {
+			r.renderChildrenRecursive(content, child.Children, depth+1)
+		}
 	}
 }
 
@@ -1590,7 +1698,10 @@ func (r *GraphRAGRetriever) retrieveWithLabelListing(
 			Data:    map[string]any{"label": label, "limit": limit},
 		})
 
+		startTime := time.Now()
 		results, total, err := r.neo4jClient.ListNodesByLabel(ctx, label, limit, "name")
+		queryDuration := time.Since(startTime)
+
 		if err != nil {
 			r.emitDebug(DebugEvent{
 				Type:    DebugEventStep,
@@ -1604,6 +1715,9 @@ func (r *GraphRAGRetriever) retrieveWithLabelListing(
 			Message: fmt.Sprintf("Found %d nodes for label '%s' (total: %d)", len(results), label, total),
 			Data:    map[string]any{"label": label, "count": len(results), "total": total},
 		})
+
+		// Emit viz events for label listing
+		r.emitVizForLabelListing(label, results, total, queryDuration)
 
 		// Format as document
 		doc := r.formatLabelListDocument(results, label, total, limit)

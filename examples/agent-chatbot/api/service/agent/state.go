@@ -34,6 +34,9 @@ type AgentState struct {
 
 	// 디버그 정보
 	DebugInfo *DebugInfo
+
+	// 가시화 데이터 수집기 (StreamWithDebug에서 초기화)
+	Visualization *VisualizationCollector
 }
 
 // NewAgentState creates a new agent state with default values
