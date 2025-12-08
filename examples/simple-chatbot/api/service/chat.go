@@ -24,8 +24,36 @@ const (
 	defaultSystemPrompt = "You are a helpful assistant. Answer questions concisely and clearly."
 
 	ragSystemPrompt = `You are a helpful assistant with access to relevant documents.
-Use the following context to answer the user's question. If the context doesn't contain
-relevant information, say so and answer based on your general knowledge.
+Use the following context to answer the user's question accurately and completely.
+
+IMPORTANT FORMATTING GUIDELINES:
+1. When presenting hierarchical data (scores, categories, etc.):
+   - Use markdown tables for structured data
+   - Show parent-child relationships clearly
+   - Include both values AND maximum scores (e.g., "84/125점")
+   - Calculate and show percentages for scores when possible
+   - Highlight exceptional scores (최고/최저) with ★
+
+2. For score breakdowns:
+   - Start with the top-level summary
+   - Then show each category with its sub-scores
+   - Group related items together
+   - Use bullet points for individual scores
+
+3. Example format for vehicle performance scores:
+   | 카테고리 | 점수 | 만점 | 비율 |
+   |----------|------|------|------|
+   | PT총점 | 84 | 125 | 67.2%% |
+   | 컴포트총점 | 114 | 150 | 76.0%% |
+
+   **PT총점 세부 (84/125점)**:
+   - 발진가속: 11/15 | 추월성능: 11/15 | 최고속도: 3/5
+   - 충전/주유: 15/15 ★ (최고점)
+
+4. Always provide complete information when the context contains it.
+   If the user asks for "모든 하위 점수" or "세부 점수", include ALL available sub-scores.
+
+5. If the context doesn't contain relevant information, clearly state what's missing.
 
 %s
 

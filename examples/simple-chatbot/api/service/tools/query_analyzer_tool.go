@@ -30,11 +30,13 @@ type QueryAnalysisInput struct {
 
 // QueryAnalysisOutput defines the analysis result
 type QueryAnalysisOutput struct {
-	StartEntity StartEntityInfo `json:"start_entity"`
-	Target      TargetInfo      `json:"target"`
-	QueryType   string          `json:"query_type"` // factual, comparison, list, aggregation
-	Confidence  float64         `json:"confidence"`
-	Reasoning   string          `json:"reasoning"`
+	StartEntity    StartEntityInfo `json:"start_entity"`
+	Target         TargetInfo      `json:"target"`
+	QueryType      string          `json:"query_type"` // factual, comparison, list, aggregation
+	IsHierarchical bool            `json:"is_hierarchical"` // Whether user wants hierarchical/nested data
+	HierarchyDepth int             `json:"hierarchy_depth"` // Suggested depth for hierarchical queries (1-5)
+	Confidence     float64         `json:"confidence"`
+	Reasoning      string          `json:"reasoning"`
 }
 
 // StartEntityInfo contains information about the starting entity
@@ -139,7 +141,7 @@ User Query: %s
 
 Extract:
 1. start_entity: Main entity to search for
-   - keywords: Search terms (e.g., vehicle name like "POLO", "NE2")
+   - keywords: Search terms (e.g., vehicle name like "POLO", "NE2", "Tucson")
    - expected_labels: Most likely node types (e.g., ["Vehicle", "CompetitorVehicle"])
 
 2. target: Information the user wants
@@ -149,7 +151,17 @@ Extract:
 
 3. query_type: factual, comparison, list, or aggregation
 
-4. confidence: 0.0 to 1.0 (how confident you are about the analysis)
+4. is_hierarchical: true if user is asking for nested/hierarchical data
+   - Hierarchical keywords: "하위", "세부", "모두", "전체", "상세", "연결된", "관련", "포함"
+   - English: "breakdown", "details", "all", "complete", "sub-scores", "children", "nested"
+   - Example: "하위 점수 모두 알려줘" → is_hierarchical: true
+
+5. hierarchy_depth: If hierarchical, suggest depth (1-5, default 3)
+   - 1: Direct children only
+   - 2-3: Include grandchildren (recommended for score queries)
+   - 4-5: Full tree traversal
+
+6. confidence: 0.0 to 1.0 (how confident you are about the analysis)
    - 0.0-0.5: Ambiguous query, needs clarification
    - 0.5-0.8: Reasonably clear
    - 0.8-1.0: Very clear intent
@@ -159,6 +171,8 @@ Return ONLY valid JSON (no markdown, no explanation):
   "start_entity": {"keywords": [""], "expected_labels": [""]},
   "target": {"expected_labels": [""], "expected_relationships": [""], "attributes": [""]},
   "query_type": "",
+  "is_hierarchical": false,
+  "hierarchy_depth": 0,
   "confidence": 0.0,
   "reasoning": ""
 }`, labels, rels, query)

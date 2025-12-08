@@ -24,7 +24,14 @@ const (
 	DebugEventPlan          DebugEventType = "plan"
 	DebugEventShortestPath  DebugEventType = "shortest_path"
 	DebugEventClarification DebugEventType = "clarification"
+	DebugEventHierarchy     DebugEventType = "hierarchy"
 )
+
+// Hierarchical query keywords in Korean and English
+var hierarchicalKeywords = []string{
+	"하위", "세부", "모두", "전체", "상세", "연결된", "관련", "포함",
+	"breakdown", "details", "all", "complete", "sub", "children", "nested",
+}
 
 // DebugEvent represents a debug event from GraphRAGRetriever
 type DebugEvent struct {
@@ -208,10 +215,13 @@ func (r *GraphRAGRetriever) retrieveWithShortestPath(ctx context.Context, query 
 		return r.retrieveLegacy(ctx, query, topK)
 	}
 
+	// Check if this is a hierarchical query (e.g., "하위 점수 모두")
+	isHierarchical := r.DetectHierarchicalQuery(query)
+
 	r.emitDebug(DebugEvent{
 		Type:    DebugEventPlan,
-		Message: fmt.Sprintf("Analysis: confidence=%.2f, targets=%v", analysis.Confidence, analysis.Target.ExpectedLabels),
-		Data:    map[string]any{"analysis": analysis},
+		Message: fmt.Sprintf("Analysis: confidence=%.2f, targets=%v, hierarchical=%v", analysis.Confidence, analysis.Target.ExpectedLabels, isHierarchical),
+		Data:    map[string]any{"analysis": analysis, "is_hierarchical": isHierarchical},
 	})
 
 	// Check if clarification is needed (low confidence)
@@ -273,8 +283,8 @@ func (r *GraphRAGRetriever) retrieveWithShortestPath(ctx context.Context, query 
 
 	r.emitDebug(DebugEvent{
 		Type:    DebugEventStep,
-		Message: fmt.Sprintf("Stage 3: Shortest Path to %v", targetLabels),
-		Data:    map[string]any{"target_labels": targetLabels},
+		Message: fmt.Sprintf("Stage 3: Shortest Path to %v (hierarchical=%v)", targetLabels, isHierarchical),
+		Data:    map[string]any{"target_labels": targetLabels, "is_hierarchical": isHierarchical},
 	})
 
 	documents := make([]*schema.Document, 0)
@@ -283,6 +293,29 @@ func (r *GraphRAGRetriever) retrieveWithShortestPath(ctx context.Context, query 
 	// For each top candidate, find paths to target labels
 	maxCandidates := min(3, len(searchResult.Candidates))
 	for _, candidate := range searchResult.Candidates[:maxCandidates] {
+		// If hierarchical query, use hierarchical retrieval
+		if isHierarchical {
+			r.emitDebug(DebugEvent{
+				Type:    DebugEventHierarchy,
+				Message: fmt.Sprintf("Using hierarchical retrieval for %s", candidate.Name),
+				Data:    map[string]any{"source": candidate.Name, "targets": targetLabels},
+			})
+
+			hierarchicalDocs, err := r.RetrieveWithHierarchy(ctx, query, candidate, targetLabels, 4)
+			if err != nil {
+				r.emitDebug(DebugEvent{
+					Type:    DebugEventStep,
+					Message: fmt.Sprintf("Hierarchical retrieval failed: %v, falling back to shortest path", err),
+				})
+				// Fall through to regular shortest path
+			} else if len(hierarchicalDocs) > 0 {
+				documents = append(documents, hierarchicalDocs...)
+				// Hierarchical retrieval returns comprehensive data, so we're done
+				return documents, nil
+			}
+		}
+
+		// Regular shortest path retrieval
 		for _, targetLabel := range targetLabels {
 			paths, err := r.neo4jClient.ShortestPathToLabel(ctx, candidate.UUID, targetLabel, 6, topK)
 			if err != nil {
@@ -851,6 +884,363 @@ func (r *GraphRAGRetriever) RetrieveWithSourceAndTargets(
 	}
 
 	return documents, nil
+}
+
+// DetectHierarchicalQuery checks if query asks for hierarchical data
+// Returns true if the query contains keywords indicating hierarchical/nested data request
+func (r *GraphRAGRetriever) DetectHierarchicalQuery(query string) bool {
+	lowerQuery := strings.ToLower(query)
+	for _, kw := range hierarchicalKeywords {
+		if strings.Contains(lowerQuery, strings.ToLower(kw)) {
+			return true
+		}
+	}
+	return false
+}
+
+// RetrieveWithHierarchy performs hierarchical retrieval for queries asking for nested data
+// This is the main entry point for hierarchical queries like "하위 점수 모두 알려줘"
+func (r *GraphRAGRetriever) RetrieveWithHierarchy(
+	ctx context.Context,
+	query string,
+	sourceNode tools.NodeCandidate,
+	targetLabels []string,
+	maxDepth int,
+) ([]*schema.Document, error) {
+	if maxDepth <= 0 {
+		maxDepth = 4 // Default: 4 levels deep for score hierarchies
+	}
+
+	r.emitDebug(DebugEvent{
+		Type:    DebugEventHierarchy,
+		Message: fmt.Sprintf("Starting hierarchical retrieval from %s to %v (depth=%d)", sourceNode.Name, targetLabels, maxDepth),
+		Data:    map[string]any{"source": sourceNode.Name, "targets": targetLabels, "max_depth": maxDepth},
+	})
+
+	// Step 1: Find path to target label to get target node UUID
+	var targetNodeUUID string
+	var targetLabel string
+
+	for _, tl := range targetLabels {
+		paths, err := r.neo4jClient.ShortestPathToLabel(ctx, sourceNode.UUID, tl, 6, 1)
+		if err != nil || len(paths) == 0 {
+			continue
+		}
+
+		targetNodeUUID = paths[0].EndNodeUUID
+		targetLabel = tl
+
+		r.emitDebug(DebugEvent{
+			Type:    DebugEventShortestPath,
+			Message: fmt.Sprintf("Found path to %s: %s", tl, paths[0].PathChain),
+			Data:    map[string]any{"path": paths[0]},
+		})
+		break
+	}
+
+	if targetNodeUUID == "" {
+		return nil, fmt.Errorf("no path found to target labels: %v", targetLabels)
+	}
+
+	// Step 2: Get hierarchical children from target node
+	_, children, err := r.neo4jClient.GetPerformanceScoreDetails(ctx, targetNodeUUID, maxDepth)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get hierarchical children: %w", err)
+	}
+
+	r.emitDebug(DebugEvent{
+		Type:    DebugEventHierarchy,
+		Message: fmt.Sprintf("Retrieved %d hierarchical nodes", len(children)),
+		Data:    map[string]any{"children_count": len(children)},
+	})
+
+	// Step 3: Build hierarchical tree from flat list
+	tree := r.buildHierarchicalTree(targetNodeUUID, children)
+
+	// Step 4: Convert to structured document
+	doc := r.hierarchyToDocument(sourceNode, tree, targetLabel)
+
+	return []*schema.Document{doc}, nil
+}
+
+// buildHierarchicalTree builds a tree structure from flat hierarchical nodes
+func (r *GraphRAGRetriever) buildHierarchicalTree(rootUUID string, nodes []*db.HierarchicalNode) *db.HierarchicalNode {
+	// Create a map for quick lookup
+	nodeMap := make(map[string]*db.HierarchicalNode)
+	var root *db.HierarchicalNode
+
+	// First pass: create all nodes
+	for _, node := range nodes {
+		nodeMap[node.UUID] = node
+		if node.UUID == rootUUID || node.Depth == 0 {
+			root = node
+		}
+	}
+
+	// If no root found by UUID, use depth 0 or first node
+	if root == nil && len(nodes) > 0 {
+		for _, node := range nodes {
+			if node.Depth == 0 {
+				root = node
+				break
+			}
+		}
+		if root == nil {
+			root = nodes[0]
+		}
+	}
+
+	// Second pass: build relationships based on depth
+	// Group children by depth
+	depthGroups := make(map[int][]*db.HierarchicalNode)
+	for _, node := range nodes {
+		if node.UUID != rootUUID {
+			depthGroups[node.Depth] = append(depthGroups[node.Depth], node)
+		}
+	}
+
+	// Attach children to root (depth 1 nodes are direct children of root)
+	if root != nil && len(depthGroups[1]) > 0 {
+		root.Children = depthGroups[1]
+	}
+
+	// Attach deeper levels (simplified: attach all depth N nodes to depth N-1 nodes that seem related)
+	for depth := 2; depth <= 5; depth++ {
+		parentNodes := depthGroups[depth-1]
+		childNodes := depthGroups[depth]
+
+		for _, child := range childNodes {
+			// Try to find parent by name matching or just attach to first available parent
+			attached := false
+			for _, parent := range parentNodes {
+				// Check if child name contains parent name keywords
+				if r.isLikelyChild(parent, child) {
+					parent.Children = append(parent.Children, child)
+					attached = true
+					break
+				}
+			}
+			// If no match found, attach to first parent at previous depth
+			if !attached && len(parentNodes) > 0 {
+				parentNodes[0].Children = append(parentNodes[0].Children, child)
+			}
+		}
+	}
+
+	return root
+}
+
+// isLikelyChild checks if child node is likely a child of parent based on naming patterns
+func (r *GraphRAGRetriever) isLikelyChild(parent, child *db.HierarchicalNode) bool {
+	// Check label relationships
+	parentLabel := ""
+	childLabel := ""
+	if len(parent.Labels) > 0 {
+		parentLabel = parent.Labels[0]
+	}
+	if len(child.Labels) > 0 {
+		childLabel = child.Labels[0]
+	}
+
+	// Score hierarchy patterns
+	scorePatterns := map[string][]string{
+		"PerformanceScore":         {"PTTotalScore", "ComfortTotalScore", "BodyTotalScore", "DynamicTotalScore", "EnvironmentTotalScore"},
+		"PerformanceTotalScore":    {"PerformanceScore", "ConnectedCarTotalScore"},
+		"PTTotalScore":             {"발진가속", "추월성능", "최고속도", "NVH", "응답성", "변속기", "충전주유", "테스트연비", "주행거리"},
+		"ComfortTotalScore":        {"좌석", "내부공간", "공조", "승차감", "편의성"},
+		"BodyTotalScore":           {"트렁크", "품질", "조작계", "시야", "조명"},
+		"DynamicTotalScore":        {"조향", "핸들링", "제동", "엔진", "안전"},
+		"EnvironmentTotalScore":    {"탄소배출", "배기가스", "타이어마모", "미세먼지"},
+		"ConnectedCarTotalScore":   {"텔레폰", "내비게이션", "온라인앱", "오디오", "음성제어"},
+		"AutobildTotalScore":       {"PerformanceTotalScore", "CostTotalScore"},
+	}
+
+	if expectedChildren, ok := scorePatterns[parentLabel]; ok {
+		for _, expected := range expectedChildren {
+			if strings.Contains(childLabel, expected) || strings.Contains(child.Name, expected) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// hierarchyToDocument converts a hierarchical structure to a well-formatted document
+func (r *GraphRAGRetriever) hierarchyToDocument(
+	source tools.NodeCandidate,
+	hierarchy *db.HierarchicalNode,
+	targetLabel string,
+) *schema.Document {
+	var content strings.Builder
+
+	// Title section
+	content.WriteString(fmt.Sprintf("# %s의 %s 정보\n\n", source.Name, r.getLabelDisplayName(targetLabel)))
+
+	if hierarchy == nil {
+		content.WriteString("데이터를 찾을 수 없습니다.\n")
+		return &schema.Document{
+			ID:      source.UUID,
+			Content: content.String(),
+			MetaData: map[string]any{
+				"source":       source.Name,
+				"target_label": targetLabel,
+				"hierarchy":    false,
+			},
+		}
+	}
+
+	// Top-level score
+	value := r.getPropertyValue(hierarchy.Properties, "value", "")
+	maxScore := r.getPropertyValue(hierarchy.Properties, "최대 점수", "")
+	if value != "" && maxScore != "" {
+		ratio := r.calculateRatio(value, maxScore)
+		content.WriteString(fmt.Sprintf("## %s: %v / %v (%.1f%%)\n\n", hierarchy.Name, value, maxScore, ratio))
+	} else {
+		content.WriteString(fmt.Sprintf("## %s\n\n", hierarchy.Name))
+	}
+
+	// Build category table for direct children
+	if len(hierarchy.Children) > 0 {
+		content.WriteString("| 카테고리 | 점수 | 만점 | 비율 |\n")
+		content.WriteString("|----------|------|------|------|\n")
+
+		for _, child := range hierarchy.Children {
+			childValue := r.getPropertyValue(child.Properties, "value", "-")
+			childMax := r.getPropertyValue(child.Properties, "최대 점수", "-")
+			childRatio := r.calculateRatio(childValue, childMax)
+
+			if childRatio > 0 {
+				content.WriteString(fmt.Sprintf("| %s | %v | %v | %.1f%% |\n",
+					child.Name, childValue, childMax, childRatio))
+			} else {
+				content.WriteString(fmt.Sprintf("| %s | %v | %v | - |\n",
+					child.Name, childValue, childMax))
+			}
+		}
+		content.WriteString("\n")
+
+		// Add detailed breakdown for each category
+		for _, child := range hierarchy.Children {
+			if len(child.Children) > 0 {
+				childValue := r.getPropertyValue(child.Properties, "value", "")
+				childMax := r.getPropertyValue(child.Properties, "최대 점수", "")
+				if childValue != "" && childMax != "" {
+					content.WriteString(fmt.Sprintf("### %s 세부 (%v/%v점)\n", child.Name, childValue, childMax))
+				} else {
+					content.WriteString(fmt.Sprintf("### %s 세부\n", child.Name))
+				}
+
+				// Group items in rows of 3 for readability
+				items := make([]string, 0)
+				for _, grandchild := range child.Children {
+					gcValue := r.getPropertyValue(grandchild.Properties, "value", "-")
+					gcMax := r.getPropertyValue(grandchild.Properties, "최대 점수", "-")
+					items = append(items, fmt.Sprintf("%s: %v/%v", grandchild.Name, gcValue, gcMax))
+				}
+
+				// Write items, 3 per line
+				for i := 0; i < len(items); i += 3 {
+					end := i + 3
+					if end > len(items) {
+						end = len(items)
+					}
+					content.WriteString("- " + strings.Join(items[i:end], " | ") + "\n")
+				}
+				content.WriteString("\n")
+			}
+		}
+	}
+
+	// Add properties if available
+	if len(hierarchy.Properties) > 0 && len(hierarchy.Children) == 0 {
+		content.WriteString("### 속성\n")
+		for k, v := range hierarchy.Properties {
+			if strings.HasPrefix(k, "_") || k == "uuid" || k == "embedding" {
+				continue
+			}
+			content.WriteString(fmt.Sprintf("- %s: %v\n", k, v))
+		}
+	}
+
+	return &schema.Document{
+		ID:      hierarchy.UUID,
+		Content: content.String(),
+		MetaData: map[string]any{
+			"source_uuid":   source.UUID,
+			"source_name":   source.Name,
+			"target_label":  targetLabel,
+			"hierarchy":     true,
+			"children_count": len(hierarchy.Children),
+			"source":        "graph_rag_hierarchy",
+		},
+	}
+}
+
+// getLabelDisplayName returns a human-readable name for a label
+func (r *GraphRAGRetriever) getLabelDisplayName(label string) string {
+	displayNames := map[string]string{
+		"PerformanceTotalScore":    "성능 총점",
+		"PerformanceScore":         "성능 점수",
+		"AutobildTotalScore":       "Autobild 총점",
+		"CostTotalScore":           "비용 총점",
+		"PTTotalScore":             "PT 총점",
+		"ComfortTotalScore":        "컴포트 총점",
+		"BodyTotalScore":           "바디 총점",
+		"DynamicTotalScore":        "다이나믹 총점",
+		"EnvironmentTotalScore":    "환경 총점",
+		"ConnectedCarTotalScore":   "커넥티드카 총점",
+		"Vehicle":                  "차량",
+		"CompetitorVehicle":        "경쟁 차량",
+	}
+
+	if name, ok := displayNames[label]; ok {
+		return name
+	}
+	return label
+}
+
+// getPropertyValue safely retrieves a property value
+func (r *GraphRAGRetriever) getPropertyValue(props map[string]any, key string, defaultVal string) string {
+	if props == nil {
+		return defaultVal
+	}
+	if v, ok := props[key]; ok {
+		return fmt.Sprintf("%v", v)
+	}
+	return defaultVal
+}
+
+// calculateRatio calculates percentage from value/maxScore
+func (r *GraphRAGRetriever) calculateRatio(value, maxScore any) float64 {
+	var val, max float64
+
+	switch v := value.(type) {
+	case float64:
+		val = v
+	case int64:
+		val = float64(v)
+	case int:
+		val = float64(v)
+	case string:
+		fmt.Sscanf(v, "%f", &val)
+	}
+
+	switch m := maxScore.(type) {
+	case float64:
+		max = m
+	case int64:
+		max = float64(m)
+	case int:
+		max = float64(m)
+	case string:
+		fmt.Sscanf(m, "%f", &max)
+	}
+
+	if max > 0 {
+		return (val / max) * 100
+	}
+	return 0
 }
 
 // Ensure GraphRAGRetriever implements the Retriever interface

@@ -675,3 +675,316 @@ func (c *Neo4jClient) GetReachableLabels(ctx context.Context, sourceUUID string,
 
 	return labels, nil
 }
+
+// HierarchicalNode represents a node with its children in a hierarchy
+type HierarchicalNode struct {
+	UUID       string                  `json:"uuid"`
+	Name       string                  `json:"name"`
+	Labels     []string                `json:"labels"`
+	Properties map[string]any          `json:"properties"`
+	Depth      int                     `json:"depth"`
+	Children   []*HierarchicalNode     `json:"children,omitempty"`
+}
+
+// GetHierarchicalChildren retrieves all children of a node up to maxDepth
+// Returns a flat list of nodes with their depth information
+// Used for "하위 점수 모두" type queries
+func (c *Neo4jClient) GetHierarchicalChildren(
+	ctx context.Context,
+	sourceUUID string,
+	maxDepth int,
+	relationshipTypes []string,
+) ([]*HierarchicalNode, error) {
+	if maxDepth <= 0 {
+		maxDepth = 4
+	}
+
+	// Build relationship filter
+	relFilter := ""
+	if len(relationshipTypes) > 0 {
+		relFilter = ":"
+		for i, rt := range relationshipTypes {
+			if i > 0 {
+				relFilter += "|"
+			}
+			relFilter += rt
+		}
+	}
+
+	// Query to get all descendants with their depth
+	cypher := fmt.Sprintf(`
+		MATCH (source {uuid: $uuid})
+		OPTIONAL MATCH path = (source)-[r%s*1..%d]->(child)
+		WITH source, child, length(path) as depth
+		WHERE child IS NOT NULL
+		RETURN DISTINCT
+			child.uuid AS uuid,
+			child.name AS name,
+			labels(child) AS labels,
+			properties(child) AS properties,
+			depth
+		ORDER BY depth, child.name
+	`, relFilter, maxDepth)
+
+	params := map[string]any{
+		"uuid": sourceUUID,
+	}
+
+	results, err := c.ExecuteQuery(ctx, cypher, params)
+	if err != nil {
+		return nil, fmt.Errorf("hierarchical query failed: %w", err)
+	}
+
+	// Parse results into HierarchicalNode list
+	nodes := make([]*HierarchicalNode, 0, len(results))
+	for _, r := range results {
+		node := &HierarchicalNode{
+			Children: make([]*HierarchicalNode, 0),
+		}
+
+		if uuid, ok := r["uuid"].(string); ok {
+			node.UUID = uuid
+		}
+		if name, ok := r["name"].(string); ok {
+			node.Name = name
+		}
+		if labels, ok := r["labels"].([]any); ok {
+			node.Labels = make([]string, 0, len(labels))
+			for _, l := range labels {
+				if label, ok := l.(string); ok {
+					node.Labels = append(node.Labels, label)
+				}
+			}
+		}
+		if props, ok := r["properties"].(map[string]any); ok {
+			node.Properties = props
+		}
+		if depth, ok := r["depth"].(int64); ok {
+			node.Depth = int(depth)
+		}
+
+		nodes = append(nodes, node)
+	}
+
+	return nodes, nil
+}
+
+// GetScoreHierarchy retrieves the complete score hierarchy for a vehicle
+// Optimized for Autobild score structure: Vehicle → TotalScore → SubScores → Individual Scores
+func (c *Neo4jClient) GetScoreHierarchy(
+	ctx context.Context,
+	vehicleUUID string,
+) (*HierarchicalNode, []*HierarchicalNode, error) {
+	cypher := `
+		MATCH (v {uuid: $uuid})
+
+		// Get vehicle info
+		WITH v
+
+		// Level 1: AutobildTotalScore or any direct score
+		OPTIONAL MATCH (v)-[:hasAutobildScore|hasScore*1..2]->(scoreRoot)
+		WHERE any(label IN labels(scoreRoot) WHERE label CONTAINS 'Score' OR label CONTAINS 'Total')
+
+		// Get all sub-scores from the score root
+		OPTIONAL MATCH path = (scoreRoot)-[:hasSubScore*1..4]->(subScore)
+
+		WITH v, scoreRoot, subScore, length(path) as depth
+		WHERE subScore IS NOT NULL
+
+		RETURN
+			v.name AS vehicleName,
+			v.uuid AS vehicleUUID,
+			labels(v) AS vehicleLabels,
+			properties(v) AS vehicleProps,
+			scoreRoot.uuid AS rootUUID,
+			scoreRoot.name AS rootName,
+			labels(scoreRoot) AS rootLabels,
+			properties(scoreRoot) AS rootProps,
+			collect(DISTINCT {
+				uuid: subScore.uuid,
+				name: subScore.name,
+				labels: labels(subScore),
+				properties: properties(subScore),
+				depth: depth
+			}) AS subScores
+	`
+
+	params := map[string]any{"uuid": vehicleUUID}
+
+	results, err := c.ExecuteQuery(ctx, cypher, params)
+	if err != nil {
+		return nil, nil, fmt.Errorf("score hierarchy query failed: %w", err)
+	}
+
+	if len(results) == 0 {
+		return nil, nil, fmt.Errorf("no score hierarchy found for vehicle: %s", vehicleUUID)
+	}
+
+	r := results[0]
+
+	// Parse root node
+	root := &HierarchicalNode{
+		Children: make([]*HierarchicalNode, 0),
+	}
+	if uuid, ok := r["rootUUID"].(string); ok {
+		root.UUID = uuid
+	}
+	if name, ok := r["rootName"].(string); ok {
+		root.Name = name
+	}
+	if labels, ok := r["rootLabels"].([]any); ok {
+		root.Labels = make([]string, 0, len(labels))
+		for _, l := range labels {
+			if label, ok := l.(string); ok {
+				root.Labels = append(root.Labels, label)
+			}
+		}
+	}
+	if props, ok := r["rootProps"].(map[string]any); ok {
+		root.Properties = props
+	}
+
+	// Parse sub-scores
+	subScores := make([]*HierarchicalNode, 0)
+	if scores, ok := r["subScores"].([]any); ok {
+		for _, s := range scores {
+			if scoreMap, ok := s.(map[string]any); ok {
+				node := &HierarchicalNode{
+					Children: make([]*HierarchicalNode, 0),
+				}
+				if uuid, ok := scoreMap["uuid"].(string); ok {
+					node.UUID = uuid
+				}
+				if name, ok := scoreMap["name"].(string); ok {
+					node.Name = name
+				}
+				if labels, ok := scoreMap["labels"].([]any); ok {
+					node.Labels = make([]string, 0, len(labels))
+					for _, l := range labels {
+						if label, ok := l.(string); ok {
+							node.Labels = append(node.Labels, label)
+						}
+					}
+				}
+				if props, ok := scoreMap["properties"].(map[string]any); ok {
+					node.Properties = props
+				}
+				if depth, ok := scoreMap["depth"].(int64); ok {
+					node.Depth = int(depth)
+				}
+				subScores = append(subScores, node)
+			}
+		}
+	}
+
+	return root, subScores, nil
+}
+
+// GetPerformanceScoreDetails retrieves detailed performance scores for a specific score node
+// This is optimized for getting all sub-scores under a PerformanceTotalScore or similar
+func (c *Neo4jClient) GetPerformanceScoreDetails(
+	ctx context.Context,
+	scoreNodeUUID string,
+	maxDepth int,
+) (*HierarchicalNode, []*HierarchicalNode, error) {
+	if maxDepth <= 0 {
+		maxDepth = 4
+	}
+
+	cypher := fmt.Sprintf(`
+		MATCH (root {uuid: $uuid})
+
+		// Get all sub-scores with their hierarchy
+		OPTIONAL MATCH path = (root)-[:hasSubScore*1..%d]->(subScore)
+
+		WITH root, subScore, length(path) as depth
+		WHERE subScore IS NOT NULL
+
+		// Order by depth to build hierarchy correctly
+		WITH root, subScore, depth
+		ORDER BY depth, subScore.name
+
+		RETURN
+			root.uuid AS rootUUID,
+			root.name AS rootName,
+			labels(root) AS rootLabels,
+			properties(root) AS rootProps,
+			collect({
+				uuid: subScore.uuid,
+				name: subScore.name,
+				labels: labels(subScore),
+				properties: properties(subScore),
+				depth: depth
+			}) AS children
+	`, maxDepth)
+
+	params := map[string]any{"uuid": scoreNodeUUID}
+
+	results, err := c.ExecuteQuery(ctx, cypher, params)
+	if err != nil {
+		return nil, nil, fmt.Errorf("performance score details query failed: %w", err)
+	}
+
+	if len(results) == 0 {
+		return nil, nil, fmt.Errorf("no score details found for: %s", scoreNodeUUID)
+	}
+
+	r := results[0]
+
+	// Parse root
+	root := &HierarchicalNode{
+		Children: make([]*HierarchicalNode, 0),
+	}
+	if uuid, ok := r["rootUUID"].(string); ok {
+		root.UUID = uuid
+	}
+	if name, ok := r["rootName"].(string); ok {
+		root.Name = name
+	}
+	if labels, ok := r["rootLabels"].([]any); ok {
+		root.Labels = make([]string, 0, len(labels))
+		for _, l := range labels {
+			if label, ok := l.(string); ok {
+				root.Labels = append(root.Labels, label)
+			}
+		}
+	}
+	if props, ok := r["rootProps"].(map[string]any); ok {
+		root.Properties = props
+	}
+
+	// Parse children
+	children := make([]*HierarchicalNode, 0)
+	if childList, ok := r["children"].([]any); ok {
+		for _, c := range childList {
+			if childMap, ok := c.(map[string]any); ok {
+				node := &HierarchicalNode{
+					Children: make([]*HierarchicalNode, 0),
+				}
+				if uuid, ok := childMap["uuid"].(string); ok {
+					node.UUID = uuid
+				}
+				if name, ok := childMap["name"].(string); ok {
+					node.Name = name
+				}
+				if labels, ok := childMap["labels"].([]any); ok {
+					node.Labels = make([]string, 0, len(labels))
+					for _, l := range labels {
+						if label, ok := l.(string); ok {
+							node.Labels = append(node.Labels, label)
+						}
+					}
+				}
+				if props, ok := childMap["properties"].(map[string]any); ok {
+					node.Properties = props
+				}
+				if depth, ok := childMap["depth"].(int64); ok {
+					node.Depth = int(depth)
+				}
+				children = append(children, node)
+			}
+		}
+	}
+
+	return root, children, nil
+}
