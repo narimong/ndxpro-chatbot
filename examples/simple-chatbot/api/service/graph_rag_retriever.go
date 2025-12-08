@@ -274,6 +274,10 @@ func (r *GraphRAGRetriever) retrieveWithShortestPath(ctx context.Context, query 
 		return []*schema.Document{}, nil
 	}
 
+	// Enrich candidates with variant info (engine, trim, year) for disambiguation
+	// This is essential when multiple variants of the same vehicle exist (e.g., Tucson 1.6T vs 2.0D)
+	searchResult.Candidates = r.enrichCandidatesWithVariant(ctx, searchResult.Candidates)
+
 	// Stage 3: Shortest Path Navigation to target labels
 	targetLabels := analysis.Target.ExpectedLabels
 	if len(targetLabels) == 0 {
@@ -700,6 +704,12 @@ func (r *GraphRAGRetriever) SearchInitialNodes(
 			candidate.Score = score
 		}
 
+		// Extract properties and variant info
+		if props, ok := r["properties"].(map[string]any); ok {
+			candidate.Properties = props
+			candidate.VariantInfo = db.ExtractVariantInfo(props)
+		}
+
 		candidates = append(candidates, candidate)
 	}
 
@@ -768,6 +778,12 @@ func (r *GraphRAGRetriever) SearchInitialNodesWithLabelHint(
 
 		if score, ok := r["score"].(float64); ok {
 			candidate.Score = score
+		}
+
+		// Extract properties and variant info
+		if props, ok := r["properties"].(map[string]any); ok {
+			candidate.Properties = props
+			candidate.VariantInfo = db.ExtractVariantInfo(props)
 		}
 
 		candidates = append(candidates, candidate)
@@ -943,7 +959,7 @@ func (r *GraphRAGRetriever) RetrieveWithHierarchy(
 	}
 
 	// Step 2: Get hierarchical children from target node
-	_, children, err := r.neo4jClient.GetPerformanceScoreDetails(ctx, targetNodeUUID, maxDepth)
+	root, children, err := r.neo4jClient.GetPerformanceScoreDetails(ctx, targetNodeUUID, maxDepth)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get hierarchical children: %w", err)
 	}
@@ -954,8 +970,9 @@ func (r *GraphRAGRetriever) RetrieveWithHierarchy(
 		Data:    map[string]any{"children_count": len(children)},
 	})
 
-	// Step 3: Build hierarchical tree from flat list
-	tree := r.buildHierarchicalTree(targetNodeUUID, children)
+	// Step 3: Build hierarchical tree from flat list (include root in nodes)
+	allNodes := append([]*db.HierarchicalNode{root}, children...)
+	tree := r.buildHierarchicalTree(root.UUID, allNodes)
 
 	// Step 4: Convert to structured document
 	doc := r.hierarchyToDocument(sourceNode, tree, targetLabel)
@@ -963,13 +980,95 @@ func (r *GraphRAGRetriever) RetrieveWithHierarchy(
 	return []*schema.Document{doc}, nil
 }
 
+// RetrieveWithHierarchyByUUID performs hierarchical retrieval starting from a known source UUID
+// Used after clarification when source node is already selected by the user
+func (r *GraphRAGRetriever) RetrieveWithHierarchyByUUID(
+	ctx context.Context,
+	sourceUUID string,
+	sourceName string,
+	targetLabels []string,
+	maxDepth int,
+) ([]*schema.Document, error) {
+	if maxDepth <= 0 {
+		maxDepth = 4 // Default: 4 levels deep for score hierarchies
+	}
+
+	r.emitDebug(DebugEvent{
+		Type:    DebugEventHierarchy,
+		Message: fmt.Sprintf("Starting hierarchical retrieval by UUID from %s (%s) to %v (depth=%d)", sourceName, sourceUUID[:8], targetLabels, maxDepth),
+		Data:    map[string]any{"source_uuid": sourceUUID, "source_name": sourceName, "targets": targetLabels, "max_depth": maxDepth},
+	})
+
+	// Create a minimal source node candidate
+	sourceNode := tools.NodeCandidate{
+		UUID: sourceUUID,
+		Name: sourceName,
+	}
+
+	var documents []*schema.Document
+
+	for _, targetLabel := range targetLabels {
+		// Step 1: Find path to target label to get target node UUID
+		paths, err := r.neo4jClient.ShortestPathToLabel(ctx, sourceUUID, targetLabel, 6, 1)
+		if err != nil || len(paths) == 0 {
+			r.emitDebug(DebugEvent{
+				Type:    DebugEventShortestPath,
+				Message: fmt.Sprintf("No path found to %s, trying next label", targetLabel),
+			})
+			continue
+		}
+
+		targetNodeUUID := paths[0].EndNodeUUID
+
+		r.emitDebug(DebugEvent{
+			Type:    DebugEventShortestPath,
+			Message: fmt.Sprintf("Found path to %s: %s", targetLabel, paths[0].PathChain),
+			Data:    map[string]any{"path": paths[0]},
+		})
+
+		// Step 2: Get hierarchical children from target node
+		root, children, err := r.neo4jClient.GetPerformanceScoreDetails(ctx, targetNodeUUID, maxDepth)
+		if err != nil {
+			r.emitDebug(DebugEvent{
+				Type:    DebugEventHierarchy,
+				Message: fmt.Sprintf("Failed to get hierarchical children: %v, falling back to path document", err),
+			})
+			// Fallback to simple path document
+			doc := r.pathToDocument(sourceNode, paths[0], targetLabel)
+			documents = append(documents, doc)
+			continue
+		}
+
+		r.emitDebug(DebugEvent{
+			Type:    DebugEventHierarchy,
+			Message: fmt.Sprintf("Retrieved %d hierarchical nodes for %s", len(children), targetLabel),
+			Data:    map[string]any{"children_count": len(children)},
+		})
+
+		// Step 3: Build hierarchical tree from flat list (include root in nodes)
+		allNodes := append([]*db.HierarchicalNode{root}, children...)
+		tree := r.buildHierarchicalTree(root.UUID, allNodes)
+
+		// Step 4: Convert to structured document with full hierarchy
+		doc := r.hierarchyToDocument(sourceNode, tree, targetLabel)
+		documents = append(documents, doc)
+	}
+
+	if len(documents) == 0 {
+		return nil, fmt.Errorf("no hierarchical data found for labels: %v", targetLabels)
+	}
+
+	return documents, nil
+}
+
 // buildHierarchicalTree builds a tree structure from flat hierarchical nodes
+// Uses ParentUUID for accurate parent-child relationships from Neo4j graph
 func (r *GraphRAGRetriever) buildHierarchicalTree(rootUUID string, nodes []*db.HierarchicalNode) *db.HierarchicalNode {
 	// Create a map for quick lookup
 	nodeMap := make(map[string]*db.HierarchicalNode)
 	var root *db.HierarchicalNode
 
-	// First pass: create all nodes
+	// First pass: register all nodes in map and find root
 	for _, node := range nodes {
 		nodeMap[node.UUID] = node
 		if node.UUID == rootUUID || node.Depth == 0 {
@@ -990,40 +1089,23 @@ func (r *GraphRAGRetriever) buildHierarchicalTree(rootUUID string, nodes []*db.H
 		}
 	}
 
-	// Second pass: build relationships based on depth
-	// Group children by depth
-	depthGroups := make(map[int][]*db.HierarchicalNode)
+	// Second pass: build relationships using ParentUUID
 	for _, node := range nodes {
-		if node.UUID != rootUUID {
-			depthGroups[node.Depth] = append(depthGroups[node.Depth], node)
+		if node.UUID == rootUUID {
+			continue // Skip root node
 		}
-	}
 
-	// Attach children to root (depth 1 nodes are direct children of root)
-	if root != nil && len(depthGroups[1]) > 0 {
-		root.Children = depthGroups[1]
-	}
-
-	// Attach deeper levels (simplified: attach all depth N nodes to depth N-1 nodes that seem related)
-	for depth := 2; depth <= 5; depth++ {
-		parentNodes := depthGroups[depth-1]
-		childNodes := depthGroups[depth]
-
-		for _, child := range childNodes {
-			// Try to find parent by name matching or just attach to first available parent
-			attached := false
-			for _, parent := range parentNodes {
-				// Check if child name contains parent name keywords
-				if r.isLikelyChild(parent, child) {
-					parent.Children = append(parent.Children, child)
-					attached = true
-					break
-				}
+		// Use ParentUUID if available (preferred - accurate from Neo4j)
+		if node.ParentUUID != "" {
+			if parent, ok := nodeMap[node.ParentUUID]; ok {
+				parent.Children = append(parent.Children, node)
+				continue
 			}
-			// If no match found, attach to first parent at previous depth
-			if !attached && len(parentNodes) > 0 {
-				parentNodes[0].Children = append(parentNodes[0].Children, child)
-			}
+		}
+
+		// Fallback: attach depth 1 nodes to root
+		if node.Depth == 1 && root != nil {
+			root.Children = append(root.Children, node)
 		}
 	}
 
@@ -1241,6 +1323,68 @@ func (r *GraphRAGRetriever) calculateRatio(value, maxScore any) float64 {
 		return (val / max) * 100
 	}
 	return 0
+}
+
+// enrichCandidatesWithVariant enriches candidates with variant info
+// Fetches engine info from relationships if missing from node properties
+// This is essential for distinguishing between different vehicle variants (e.g., Tucson 1.6T vs Tucson 2.0D)
+func (r *GraphRAGRetriever) enrichCandidatesWithVariant(ctx context.Context, candidates []tools.NodeCandidate) []tools.NodeCandidate {
+	// Collect UUIDs that need engine info (vehicle types without engine in properties)
+	needsEngine := make([]string, 0)
+	for _, c := range candidates {
+		// Only check for vehicle-type nodes
+		isVehicle := false
+		for _, label := range c.Labels {
+			if label == "Vehicle" || label == "CompetitorVehicle" || label == "SimilarVehicle" {
+				isVehicle = true
+				break
+			}
+		}
+
+		if !isVehicle {
+			continue
+		}
+
+		// Check if engine info is missing
+		if c.VariantInfo == nil || c.VariantInfo.Engine == "" {
+			needsEngine = append(needsEngine, c.UUID)
+		}
+	}
+
+	if len(needsEngine) == 0 {
+		return candidates
+	}
+
+	// Batch fetch engine info from relationships
+	engineMap, err := r.neo4jClient.EnrichCandidatesWithEngine(ctx, needsEngine)
+	if err != nil {
+		// Log error but continue with existing data
+		r.emitDebug(DebugEvent{
+			Type:    DebugEventStep,
+			Message: fmt.Sprintf("Failed to enrich candidates with engine info: %v", err),
+		})
+		return candidates
+	}
+
+	// Enrich candidates with engine info from relationships
+	for i := range candidates {
+		if engineName, ok := engineMap[candidates[i].UUID]; ok {
+			if candidates[i].VariantInfo == nil {
+				candidates[i].VariantInfo = &db.VariantInfo{}
+			}
+			if candidates[i].VariantInfo.Engine == "" {
+				candidates[i].VariantInfo.Engine = engineName
+			}
+		}
+	}
+
+	r.emitDebug(DebugEvent{
+		Type:    DebugEventStep,
+		Message: fmt.Sprintf("Enriched %d candidates with engine info from relationships", len(engineMap)),
+		Data:    map[string]any{"enriched_count": len(engineMap)},
+	})
+
+	return candidates
 }
 
 // Ensure GraphRAGRetriever implements the Retriever interface

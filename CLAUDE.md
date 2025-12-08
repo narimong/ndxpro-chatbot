@@ -1,5 +1,8 @@
 # Eino Framework - Developer Reference
 
+
+  데이터가 변경되더라도 스스로 정보를 탐색하고 정확하고 풍부한 데이터를 기반으로 답변할 수 있도록 고민해. 모든 개발과정에 포함되어야 하는 필수적인 내용이야. 
+
 ## Project Overview
 
 **Eino** (pronounced "I know") is the ultimate LLM application development framework for Go, developed by CloudWeGo. Inspired by LangChain and LlamaIndex, it provides a production-ready toolkit emphasizing:

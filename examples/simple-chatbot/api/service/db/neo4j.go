@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
 )
@@ -678,12 +679,13 @@ func (c *Neo4jClient) GetReachableLabels(ctx context.Context, sourceUUID string,
 
 // HierarchicalNode represents a node with its children in a hierarchy
 type HierarchicalNode struct {
-	UUID       string                  `json:"uuid"`
-	Name       string                  `json:"name"`
-	Labels     []string                `json:"labels"`
-	Properties map[string]any          `json:"properties"`
-	Depth      int                     `json:"depth"`
-	Children   []*HierarchicalNode     `json:"children,omitempty"`
+	UUID       string              `json:"uuid"`
+	Name       string              `json:"name"`
+	Labels     []string            `json:"labels"`
+	Properties map[string]any      `json:"properties"`
+	Depth      int                 `json:"depth"`
+	ParentUUID string              `json:"parent_uuid,omitempty"`
+	Children   []*HierarchicalNode `json:"children,omitempty"`
 }
 
 // GetHierarchicalChildren retrieves all children of a node up to maxDepth
@@ -894,14 +896,18 @@ func (c *Neo4jClient) GetPerformanceScoreDetails(
 	cypher := fmt.Sprintf(`
 		MATCH (root {uuid: $uuid})
 
-		// Get all sub-scores with their hierarchy
+		// Get all sub-scores with their hierarchy and parent information
 		OPTIONAL MATCH path = (root)-[:hasSubScore*1..%d]->(subScore)
 
-		WITH root, subScore, length(path) as depth
+		WITH root, path, subScore, length(path) as depth, nodes(path) as pathNodes
 		WHERE subScore IS NOT NULL
 
+		// Calculate parent UUID: for depth 1, parent is root; for deeper levels, parent is previous node in path
+		WITH root, subScore, depth,
+			 CASE WHEN depth = 1 THEN root.uuid
+				  ELSE pathNodes[size(pathNodes)-2].uuid END as parentUUID
+
 		// Order by depth to build hierarchy correctly
-		WITH root, subScore, depth
 		ORDER BY depth, subScore.name
 
 		RETURN
@@ -914,7 +920,8 @@ func (c *Neo4jClient) GetPerformanceScoreDetails(
 				name: subScore.name,
 				labels: labels(subScore),
 				properties: properties(subScore),
-				depth: depth
+				depth: depth,
+				parentUUID: parentUUID
 			}) AS children
 	`, maxDepth)
 
@@ -981,10 +988,248 @@ func (c *Neo4jClient) GetPerformanceScoreDetails(
 				if depth, ok := childMap["depth"].(int64); ok {
 					node.Depth = int(depth)
 				}
+				if parentUUID, ok := childMap["parentUUID"].(string); ok {
+					node.ParentUUID = parentUUID
+				}
 				children = append(children, node)
 			}
 		}
 	}
 
 	return root, children, nil
+}
+
+// VariantPropertyKeys defines the Korean property keys used for vehicle variants
+// These are the actual property names stored in Neo4j for vehicle variant information
+var VariantPropertyKeys = struct {
+	Engine    string
+	Trim      string
+	ModelYear string
+	Fuel      string
+	XEV       string
+}{
+	Engine:    "엔진",
+	Trim:      "TRIM",
+	ModelYear: "연식",
+	Fuel:      "연료",
+	XEV:       "xEV",
+}
+
+// VariantInfo holds extracted variant information from a vehicle node
+// Used to distinguish between different variants of the same vehicle model
+type VariantInfo struct {
+	Engine    string `json:"engine,omitempty"`
+	Trim      string `json:"trim,omitempty"`
+	ModelYear string `json:"model_year,omitempty"`
+	Fuel      string `json:"fuel,omitempty"`
+	XEV       string `json:"xev,omitempty"`
+}
+
+// ExtractVariantInfo extracts variant information from node properties
+// Handles Korean property keys as stored in Neo4j
+// Note: 연식 (ModelYear) is stored as float64 in Neo4j, so we handle multiple types
+func ExtractVariantInfo(properties map[string]any) *VariantInfo {
+	if properties == nil {
+		return &VariantInfo{}
+	}
+
+	info := &VariantInfo{}
+
+	// Engine (string)
+	if v, ok := properties[VariantPropertyKeys.Engine].(string); ok {
+		info.Engine = v
+	}
+
+	// Trim (string)
+	if v, ok := properties[VariantPropertyKeys.Trim].(string); ok {
+		info.Trim = v
+	}
+
+	// ModelYear - handles float64, int, int64, and string types
+	// Neo4j stores numeric values as float64, e.g., 2022.0
+	switch v := properties[VariantPropertyKeys.ModelYear].(type) {
+	case string:
+		info.ModelYear = v
+	case float64:
+		info.ModelYear = fmt.Sprintf("%.0f", v) // 2022.0 → "2022"
+	case int:
+		info.ModelYear = fmt.Sprintf("%d", v)
+	case int64:
+		info.ModelYear = fmt.Sprintf("%d", v)
+	}
+
+	// Fuel (string)
+	if v, ok := properties[VariantPropertyKeys.Fuel].(string); ok {
+		info.Fuel = v
+	}
+
+	// XEV (string)
+	if v, ok := properties[VariantPropertyKeys.XEV].(string); ok {
+		info.XEV = v
+	}
+
+	return info
+}
+
+// FormatDisplay creates a display string for variant info
+// e.g., "1.6T HEV, Premium, 2024"
+func (v *VariantInfo) FormatDisplay() string {
+	if v == nil {
+		return ""
+	}
+
+	parts := make([]string, 0, 4)
+
+	// Engine + Fuel type + xEV combined (e.g., "1.6T gsl MHEV", "2.0D dsl MHEV")
+	if v.Engine != "" {
+		enginePart := v.Engine
+		if v.Fuel != "" {
+			enginePart += " " + v.Fuel
+		}
+		if v.XEV != "" {
+			enginePart += " " + v.XEV
+		}
+		parts = append(parts, enginePart)
+	}
+
+	// Trim
+	if v.Trim != "" {
+		parts = append(parts, v.Trim)
+	}
+
+	// Model year
+	if v.ModelYear != "" {
+		parts = append(parts, v.ModelYear)
+	}
+
+	if len(parts) == 0 {
+		return ""
+	}
+
+	return strings.Join(parts, ", ")
+}
+
+// IsEmpty returns true if no variant info is available
+func (v *VariantInfo) IsEmpty() bool {
+	if v == nil {
+		return true
+	}
+	return v.Engine == "" && v.Trim == "" && v.ModelYear == "" && v.Fuel == "" && v.XEV == ""
+}
+
+// EnrichCandidatesWithEngine adds engine info from relationships to candidates
+// This is a batch operation to minimize database queries
+func (c *Neo4jClient) EnrichCandidatesWithEngine(ctx context.Context, uuids []string) (map[string]string, error) {
+	if len(uuids) == 0 {
+		return map[string]string{}, nil
+	}
+
+	cypher := `
+		UNWIND $uuids AS uuid
+		MATCH (v {uuid: uuid})
+		OPTIONAL MATCH (v)-[:hasEngine]->(e:Engine)
+		RETURN v.uuid AS uuid, e.name AS engineName
+	`
+
+	results, err := c.ExecuteQuery(ctx, cypher, map[string]any{"uuids": uuids})
+	if err != nil {
+		return nil, err
+	}
+
+	engineMap := make(map[string]string)
+	for _, r := range results {
+		if uuid, ok := r["uuid"].(string); ok {
+			if engineName, ok := r["engineName"].(string); ok && engineName != "" {
+				engineMap[uuid] = engineName
+			}
+		}
+	}
+
+	return engineMap, nil
+}
+
+// NeighborInfo represents a 1-hop neighbor node
+type NeighborInfo struct {
+	Relationship string   `json:"relationship"`
+	Outgoing     bool     `json:"outgoing"`
+	Name         string   `json:"name"`
+	UUID         string   `json:"uuid"`
+	Labels       []string `json:"labels"`
+}
+
+// GetOneHopNeighborSummary returns a summary of 1-hop neighbors for display
+// This provides generic context for any node type
+func (c *Neo4jClient) GetOneHopNeighborSummary(ctx context.Context, uuid string, limit int) ([]NeighborInfo, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+
+	cypher := `
+		MATCH (n {uuid: $uuid})-[r]-(neighbor)
+		RETURN
+			type(r) AS relationship,
+			startNode(r) = n AS outgoing,
+			neighbor.name AS name,
+			neighbor.uuid AS uuid,
+			labels(neighbor) AS labels
+		LIMIT $limit
+	`
+
+	results, err := c.ExecuteQuery(ctx, cypher, map[string]any{
+		"uuid":  uuid,
+		"limit": limit,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	neighbors := make([]NeighborInfo, 0, len(results))
+	for _, r := range results {
+		neighbor := NeighborInfo{}
+
+		if rel, ok := r["relationship"].(string); ok {
+			neighbor.Relationship = rel
+		}
+		if outgoing, ok := r["outgoing"].(bool); ok {
+			neighbor.Outgoing = outgoing
+		}
+		if name, ok := r["name"].(string); ok {
+			neighbor.Name = name
+		}
+		if uuid, ok := r["uuid"].(string); ok {
+			neighbor.UUID = uuid
+		}
+		if labels, ok := r["labels"].([]any); ok {
+			for _, l := range labels {
+				if label, ok := l.(string); ok {
+					neighbor.Labels = append(neighbor.Labels, label)
+				}
+			}
+		}
+
+		neighbors = append(neighbors, neighbor)
+	}
+
+	return neighbors, nil
+}
+
+// GetRelationshipDisplayName returns Korean display name for relationship types
+func GetRelationshipDisplayName(relType string) string {
+	displayNames := map[string]string{
+		"hasEngine":           "엔진",
+		"hasAutobildScore":    "평가",
+		"hasSubScore":         "하위점수",
+		"hasPerformanceScore": "성능",
+		"hasCostScore":        "비용",
+		"SIMILAR_TO":          "유사차량",
+		"COMPETITOR_OF":       "경쟁차량",
+		"hasBrand":            "브랜드",
+		"hasSegment":          "세그먼트",
+		"hasBodyType":         "차체타입",
+	}
+
+	if name, ok := displayNames[relType]; ok {
+		return name
+	}
+	return relType
 }

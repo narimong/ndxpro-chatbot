@@ -192,6 +192,134 @@ class ChatApp {
         this.socket.on('debug:retrieval', (data) => {
             this.handleDebugRetrieval(data);
         });
+
+        // Clarification event listener
+        this.socket.on('clarification:request', (data) => {
+            this.handleClarificationRequest(data);
+        });
+    }
+
+    // Handle clarification request from server
+    handleClarificationRequest(data) {
+        console.log('Received clarification request:', data);
+
+        // Add debug entry
+        if (this.debugMode) {
+            this.addDebugEntry('clarification', `명확화 필요: ${data.reason}`,
+                `<div class="clarification-options">${data.options?.map((opt, i) =>
+                    `<div class="clarification-option">${i+1}. ${opt.label}</div>`
+                ).join('') || ''}</div>`, 'started');
+        }
+
+        // Create clarification UI
+        this.showClarificationDialog(data);
+    }
+
+    // Show clarification dialog to user
+    showClarificationDialog(data) {
+        // Remove existing clarification dialog if any
+        const existing = document.querySelector('.clarification-dialog');
+        if (existing) existing.remove();
+
+        const dialog = document.createElement('div');
+        dialog.className = 'clarification-dialog';
+
+        let optionsHtml = data.options?.map((opt, i) => `
+            <button class="clarification-option-btn" data-id="${opt.id}" data-target="${opt.target_label}">
+                <span class="option-label">${opt.label}</span>
+                ${opt.description ? `<span class="option-desc">${opt.description}</span>` : ''}
+            </button>
+        `).join('') || '';
+
+        dialog.innerHTML = `
+            <div class="clarification-content">
+                <div class="clarification-header">
+                    <span class="clarification-icon">❓</span>
+                    <span class="clarification-title">확인이 필요합니다</span>
+                </div>
+                <div class="clarification-reason">${data.reason || '어떤 정보를 원하시나요?'}</div>
+                <div class="clarification-options">
+                    ${optionsHtml}
+                </div>
+                ${data.allow_free_text ? `
+                    <div class="clarification-freetext">
+                        <input type="text" id="clarificationFreeText" placeholder="또는 직접 입력하세요..." />
+                        <button id="clarificationFreeTextBtn">전송</button>
+                    </div>
+                ` : ''}
+            </div>
+        `;
+
+        this.messagesContainer.appendChild(dialog);
+        this.scrollToBottom();
+
+        // Store request ID for response
+        this.pendingClarificationRequestId = data.request_id;
+
+        // Add click handlers for options
+        dialog.querySelectorAll('.clarification-option-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const selectedId = btn.dataset.id;
+                this.sendClarificationResponse(selectedId, null);
+                dialog.remove();
+            });
+        });
+
+        // Add handler for free text
+        if (data.allow_free_text) {
+            const freeTextInput = dialog.querySelector('#clarificationFreeText');
+            const freeTextBtn = dialog.querySelector('#clarificationFreeTextBtn');
+
+            freeTextBtn.addEventListener('click', () => {
+                const text = freeTextInput.value.trim();
+                if (text) {
+                    this.sendClarificationResponse(null, text);
+                    dialog.remove();
+                }
+            });
+
+            freeTextInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    const text = freeTextInput.value.trim();
+                    if (text) {
+                        this.sendClarificationResponse(null, text);
+                        dialog.remove();
+                    }
+                }
+            });
+        }
+    }
+
+    // Send clarification response to server
+    sendClarificationResponse(selectedId, freeText) {
+        if (!this.socket || !this.socket.connected) {
+            this.showToast('서버에 연결되어 있지 않습니다', 'error');
+            return;
+        }
+
+        const response = {
+            request_id: this.pendingClarificationRequestId,
+            debug: this.debugMode
+        };
+
+        if (selectedId) {
+            response.selected_id = selectedId;
+        }
+        if (freeText) {
+            response.free_text = freeText;
+        }
+
+        console.log('Sending clarification response:', response);
+        this.socket.emit('clarification:response', response);
+
+        // Show loading state
+        this.enableInput(false);
+
+        // Add debug entry
+        if (this.debugMode) {
+            this.addDebugEntry('clarification',
+                `사용자 선택: ${selectedId || freeText}`, '', 'completed');
+        }
     }
 
     handleChunk(payload) {

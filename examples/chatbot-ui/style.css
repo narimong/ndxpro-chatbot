@@ -588,3 +588,126 @@ body {
         max-height: 200px;
     }
 }
+
+/* Clarification Dialog */
+.clarification-dialog {
+    background-color: var(--container-bg);
+    border: 1px solid var(--primary-color);
+    border-radius: var(--radius);
+    margin: 16px;
+    overflow: hidden;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.clarification-content {
+    padding: 16px;
+}
+
+.clarification-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+
+.clarification-icon {
+    font-size: 1.25rem;
+}
+
+.clarification-title {
+    font-weight: 600;
+    color: var(--primary-color);
+}
+
+.clarification-reason {
+    color: var(--text-color);
+    margin-bottom: 16px;
+    font-size: 0.9rem;
+    line-height: 1.5;
+}
+
+.clarification-options {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.clarification-option-btn {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    padding: 12px 16px;
+    background-color: var(--bg-color);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius);
+    cursor: pointer;
+    transition: all 0.2s;
+    text-align: left;
+    width: 100%;
+}
+
+.clarification-option-btn:hover {
+    background-color: var(--primary-color);
+    border-color: var(--primary-color);
+}
+
+.clarification-option-btn .option-label {
+    font-weight: 500;
+    color: var(--text-color);
+}
+
+.clarification-option-btn:hover .option-label {
+    color: white;
+}
+
+.clarification-option-btn .option-desc {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    margin-top: 4px;
+}
+
+.clarification-option-btn:hover .option-desc {
+    color: rgba(255, 255, 255, 0.8);
+}
+
+.clarification-freetext {
+    margin-top: 16px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border-color);
+    display: flex;
+    gap: 8px;
+}
+
+.clarification-freetext input {
+    flex: 1;
+    padding: 10px 12px;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius);
+    background-color: var(--bg-color);
+    color: var(--text-color);
+    font-size: 0.9rem;
+}
+
+.clarification-freetext input:focus {
+    outline: none;
+    border-color: var(--primary-color);
+}
+
+.clarification-freetext button {
+    padding: 10px 16px;
+    background-color: var(--primary-color);
+    color: white;
+    border: none;
+    border-radius: var(--radius);
+    cursor: pointer;
+    font-weight: 500;
+}
+
+.clarification-freetext button:hover {
+    background-color: var(--primary-hover);
+}
+
+/* Debug entry for clarification */
+.debug-entry.clarification .debug-type {
+    background-color: #9b59b6;
+}

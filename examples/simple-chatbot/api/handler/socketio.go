@@ -166,18 +166,40 @@ func (h *SocketIOHandler) handleChat(socket *socketio.Socket, event *socketio.Ev
 	var streamReader *schema.StreamReader[*schema.Message]
 	var err error
 
-	if debugMode {
-		// Create debug emitter that sends events to the socket
-		emitter := func(event string, eventData interface{}) {
-			socket.Emit(event, eventData)
+	// Create debug emitter for clarification request storage
+	var pendingClarificationReq *service.ClarificationRequest
+	emitter := func(event string, eventData interface{}) {
+		socket.Emit(event, eventData)
+		// Store clarification request if emitted
+		if event == "clarification:request" {
+			log.Printf("[DEBUG] Received clarification:request event, eventData type: %T", eventData)
+			if req, ok := eventData.(*service.ClarificationRequest); ok {
+				pendingClarificationReq = req
+				log.Printf("[DEBUG] Stored pending clarification request: %s", req.RequestID)
+			} else {
+				log.Printf("[DEBUG] Failed to cast eventData to *ClarificationRequest")
+			}
 		}
+	}
 
+	if debugMode {
 		streamReader, err = h.chatService.ChatStreamWithDebug(ctx, sessionID, content, emitter)
 	} else {
 		streamReader, err = h.chatService.ChatStream(ctx, sessionID, content)
 	}
 
 	if err != nil {
+		// Check if this is a clarification request (not an actual error)
+		if err.Error() == "clarification_required" {
+			// Store the pending clarification request for response handling
+			if pendingClarificationReq != nil {
+				h.pendingClarificationRequests.Store(sessionID, pendingClarificationReq)
+			}
+			// The clarification request was already emitted via emitter
+			// Don't send an error - client will handle clarification:request event
+			return
+		}
+
 		socket.Emit("error", map[string]string{
 			"code":    "CHAT_ERROR",
 			"message": err.Error(),

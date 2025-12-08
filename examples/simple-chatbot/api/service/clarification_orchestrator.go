@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"simple-chatbot/api/model"
@@ -199,7 +200,53 @@ func (o *ClarificationOrchestrator) checkInitialNodeClarification(
 		}
 	}
 
+	// Case 6: Multiple variants of same vehicle name (e.g., Tucson with different engines/trims)
+	if len(candidates) > 1 && o.hasSameNameVariants(candidates) {
+		o.emitDebug(DebugEvent{
+			Type:    DebugEventClarification,
+			Message: fmt.Sprintf("Multiple variants found for same vehicle: %s", candidates[0].Name),
+			Data:    map[string]any{"variants_count": len(candidates)},
+		})
+		return true, candidates
+	}
+
 	return false, candidates
+}
+
+// hasSameNameVariants checks if candidates have the same name (different variants)
+// e.g., two Tucsons with different engines (1.6T gsl vs 1.6T dsl)
+func (o *ClarificationOrchestrator) hasSameNameVariants(candidates []tools.NodeCandidate) bool {
+	if len(candidates) < 2 {
+		return false
+	}
+
+	// Count candidates with same name as first candidate
+	firstName := candidates[0].Name
+	sameNameCount := 0
+	for _, c := range candidates {
+		if c.Name == firstName {
+			sameNameCount++
+		}
+	}
+
+	// If 2+ candidates have same name, they are variants
+	return sameNameCount >= 2
+}
+
+// detectHierarchicalQuery checks if the query asks for hierarchical/detailed data
+// Keywords like "하위", "세부", "모두", "전체", "상세" indicate hierarchical queries
+func (o *ClarificationOrchestrator) detectHierarchicalQuery(query string) bool {
+	hierarchicalKeywords := []string{
+		"하위", "세부", "모두", "전체", "상세",
+		"breakdown", "details", "all", "complete",
+	}
+	queryLower := strings.ToLower(query)
+	for _, kw := range hierarchicalKeywords {
+		if strings.Contains(queryLower, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 // checkTargetLabelClarification checks if target label clarification is needed
@@ -225,6 +272,32 @@ func (o *ClarificationOrchestrator) checkTargetLabelClarification(analysis *tool
 	return false
 }
 
+// enrichCandidatesWithNeighborInfo adds 1-hop neighbor info to candidates for better context
+// This provides generic context for any node type, not just vehicles
+func (o *ClarificationOrchestrator) enrichCandidatesWithNeighborInfo(
+	ctx context.Context,
+	candidates []tools.NodeCandidate,
+) []tools.NodeCandidate {
+	if o.neo4jClient == nil {
+		return candidates
+	}
+
+	for i := range candidates {
+		// Skip if variant info is already sufficient
+		if candidates[i].VariantInfo != nil && !candidates[i].VariantInfo.IsEmpty() {
+			continue
+		}
+
+		// Get 1-hop neighbors for additional context
+		neighbors, err := o.neo4jClient.GetOneHopNeighborSummary(ctx, candidates[i].UUID, 5)
+		if err == nil && len(neighbors) > 0 {
+			candidates[i].NeighborSummary = neighbors
+		}
+	}
+
+	return candidates
+}
+
 // buildInitialNodeDecision builds a clarification decision for initial node selection
 func (o *ClarificationOrchestrator) buildInitialNodeDecision(
 	ctx context.Context,
@@ -234,7 +307,10 @@ func (o *ClarificationOrchestrator) buildInitialNodeDecision(
 ) (*ClarificationDecision, error) {
 	requestID := uuid.New().String()
 
-	req := o.clarificationSvc.BuildInitialNodeRequest(ctx, query, candidates, requestID)
+	// Enrich candidates with 1-hop neighbor info for better disambiguation
+	enrichedCandidates := o.enrichCandidatesWithNeighborInfo(ctx, candidates)
+
+	req := o.clarificationSvc.BuildInitialNodeRequest(ctx, query, enrichedCandidates, requestID)
 
 	return &ClarificationDecision{
 		NeedsClarification:   true,
@@ -374,13 +450,36 @@ func (o *ClarificationOrchestrator) resolveTargetLabelClarification(
 		}
 	}
 
-	// Proceed with retrieval using source and target labels
-	docs, err := o.graphRAGRetriever.RetrieveWithSourceAndTargets(
-		ctx,
-		pending.SourceNodeUUID,
-		targetLabels,
-		5,
-	)
+	// Check if original query asks for hierarchical data
+	isHierarchical := o.detectHierarchicalQuery(pending.OriginalQuery)
+
+	var docs []*schema.Document
+	var err error
+
+	if isHierarchical && len(targetLabels) > 0 {
+		// Use hierarchical retrieval for "하위 점수 모두" type queries
+		o.emitDebug(DebugEvent{
+			Type:    DebugEventClarification,
+			Message: fmt.Sprintf("Using hierarchical retrieval for query: %s", pending.OriginalQuery),
+			Data:    map[string]any{"target_labels": targetLabels},
+		})
+		docs, err = o.graphRAGRetriever.RetrieveWithHierarchyByUUID(
+			ctx,
+			pending.SourceNodeUUID,
+			pending.SourceNodeName,
+			targetLabels,
+			4, // maxDepth = 4 levels
+		)
+	} else {
+		// Use standard retrieval
+		docs, err = o.graphRAGRetriever.RetrieveWithSourceAndTargets(
+			ctx,
+			pending.SourceNodeUUID,
+			targetLabels,
+			5,
+		)
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("retrieval failed: %w", err)
 	}
@@ -400,21 +499,46 @@ func (o *ClarificationOrchestrator) proceedWithRetrieval(
 	analysis *tools.QueryAnalysisOutput,
 	sourceNode tools.NodeCandidate,
 ) (*ClarificationDecision, error) {
+	// Check if query asks for hierarchical data
+	isHierarchical := o.detectHierarchicalQuery(query)
+
 	o.emitDebug(DebugEvent{
 		Type:    DebugEventStep,
 		Message: "Proceeding with retrieval",
 		Data: map[string]any{
-			"source":        sourceNode.Name,
-			"target_labels": analysis.Target.ExpectedLabels,
+			"source":         sourceNode.Name,
+			"target_labels":  analysis.Target.ExpectedLabels,
+			"is_hierarchical": isHierarchical,
 		},
 	})
 
-	docs, err := o.graphRAGRetriever.RetrieveWithSourceAndTargets(
-		ctx,
-		sourceNode.UUID,
-		analysis.Target.ExpectedLabels,
-		5,
-	)
+	var docs []*schema.Document
+	var err error
+
+	if isHierarchical && len(analysis.Target.ExpectedLabels) > 0 {
+		// Use hierarchical retrieval for queries asking for detailed data
+		o.emitDebug(DebugEvent{
+			Type:    DebugEventClarification,
+			Message: fmt.Sprintf("Using hierarchical retrieval for query: %s", query),
+			Data:    map[string]any{"target_labels": analysis.Target.ExpectedLabels},
+		})
+		docs, err = o.graphRAGRetriever.RetrieveWithHierarchyByUUID(
+			ctx,
+			sourceNode.UUID,
+			sourceNode.Name,
+			analysis.Target.ExpectedLabels,
+			4, // maxDepth = 4 levels
+		)
+	} else {
+		// Use standard retrieval
+		docs, err = o.graphRAGRetriever.RetrieveWithSourceAndTargets(
+			ctx,
+			sourceNode.UUID,
+			analysis.Target.ExpectedLabels,
+			5,
+		)
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("retrieval failed: %w", err)
 	}

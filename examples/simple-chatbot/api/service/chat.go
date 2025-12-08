@@ -190,81 +190,162 @@ func (c *ChatService) ChatStreamWithDebug(
 	// Set emitter for planner
 	c.planner.SetEmitter(emitter)
 
-	// Step 1: Create execution plan
-	emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
-		StepID:    "planning",
-		StepName:  "Planner",
-		Component: apimodel.ComponentPlanner,
-		Status:    apimodel.StatusStarted,
-		Input:     map[string]string{"query": truncateString(input, 100)},
-		Timestamp: time.Now().UnixMilli(),
-	})
+	// Check for pending clarification first
+	pending, _ := c.sessionStore.GetPendingClarification(sessionID)
 
-	plan, err := c.planner.CreatePlan(ctx, input)
-	if err != nil {
-		// Continue without plan on error
-		plan = nil
+	// Step 0: Check ClarificationOrchestrator for initial node clarification
+	orchestrator := c.GetClarificationOrchestrator(emitter)
+	var docs []*schema.Document
+	var plan *Plan
+	skipRetrieval := false
+
+	if orchestrator != nil && c.GetGraphRAGRetriever() != nil {
+		emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
+			StepID:    "clarification_check",
+			StepName:  "ClarificationOrchestrator",
+			Component: "clarification",
+			Status:    apimodel.StatusStarted,
+			Input:     map[string]string{"query": truncateString(input, 100)},
+			Timestamp: time.Now().UnixMilli(),
+		})
+
+		decision, err := orchestrator.ProcessQuery(ctx, input, pending)
+		if err == nil {
+			emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
+				StepID:    "clarification_check",
+				StepName:  "ClarificationOrchestrator",
+				Component: "clarification",
+				Status:    apimodel.StatusCompleted,
+				Output: map[string]interface{}{
+					"needs_clarification": decision.NeedsClarification,
+					"phase":               string(decision.Phase),
+				},
+				Timestamp: time.Now().UnixMilli(),
+			})
+
+			if decision.NeedsClarification {
+				// Store pending clarification state
+				c.sessionStore.SetPendingClarification(sessionID, &apimodel.PendingClarification{
+					Phase:          decision.Phase,
+					OriginalQuery:  input,
+					SourceNodeUUID: decision.SourceNodeUUID,
+					SourceNodeName: decision.SourceNodeName,
+					CreatedAt:      time.Now(),
+				})
+
+				// Emit clarification request to client
+				log.Printf("[DEBUG] Emitting clarification:request with RequestID=%s, Options=%d",
+					decision.ClarificationRequest.RequestID,
+					len(decision.ClarificationRequest.Options))
+				emitter(apimodel.EventClarificationReq, decision.ClarificationRequest)
+
+				// Return special error to indicate clarification is needed
+				return nil, fmt.Errorf("clarification_required")
+			}
+
+			// Use documents from orchestrator decision if available
+			if len(decision.Documents) > 0 {
+				docs = decision.Documents
+				skipRetrieval = true
+			}
+		} else {
+			emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
+				StepID:    "clarification_check",
+				StepName:  "ClarificationOrchestrator",
+				Component: "clarification",
+				Status:    apimodel.StatusCompleted,
+				Output:    map[string]interface{}{"error": err.Error()},
+				Timestamp: time.Now().UnixMilli(),
+			})
+		}
 	}
 
-	emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
-		StepID:    "planning",
-		StepName:  "Planner",
-		Component: apimodel.ComponentPlanner,
-		Status:    apimodel.StatusCompleted,
-		Output:    map[string]interface{}{"plan_steps": len(plan.Steps)},
-		Timestamp: time.Now().UnixMilli(),
-	})
+	// Clear any pending clarification since we're proceeding
+	c.sessionStore.ClearPendingClarification(sessionID)
 
-	// Step 2: Query rewriting (MultiQuery)
-	emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
-		StepID:    "query_rewrite",
-		StepName:  "QueryRewriter",
-		Component: apimodel.ComponentQueryRewriter,
-		Status:    apimodel.StatusStarted,
-		Input:     map[string]string{"original_query": truncateString(input, 100)},
-		Timestamp: time.Now().UnixMilli(),
-	})
+	// If we don't have documents from orchestrator, do regular retrieval
+	if !skipRetrieval {
+		// Step 1: Create execution plan
+		emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
+			StepID:    "planning",
+			StepName:  "Planner",
+			Component: apimodel.ComponentPlanner,
+			Status:    apimodel.StatusStarted,
+			Input:     map[string]string{"query": truncateString(input, 100)},
+			Timestamp: time.Now().UnixMilli(),
+		})
 
-	queries, err := c.rewriteQueries(ctx, input)
-	if err != nil {
-		queries = []string{input} // Fallback to original query
+		var planErr error
+		plan, planErr = c.planner.CreatePlan(ctx, input)
+		if planErr != nil {
+			// Continue without plan on error
+			plan = nil
+		}
+
+		planSteps := 0
+		if plan != nil {
+			planSteps = len(plan.Steps)
+		}
+		emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
+			StepID:    "planning",
+			StepName:  "Planner",
+			Component: apimodel.ComponentPlanner,
+			Status:    apimodel.StatusCompleted,
+			Output:    map[string]interface{}{"plan_steps": planSteps},
+			Timestamp: time.Now().UnixMilli(),
+		})
+
+		// Step 2: Query rewriting (MultiQuery)
+		emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
+			StepID:    "query_rewrite",
+			StepName:  "QueryRewriter",
+			Component: apimodel.ComponentQueryRewriter,
+			Status:    apimodel.StatusStarted,
+			Input:     map[string]string{"original_query": truncateString(input, 100)},
+			Timestamp: time.Now().UnixMilli(),
+		})
+
+		queries, rewriteErr := c.rewriteQueries(ctx, input)
+		if rewriteErr != nil {
+			queries = []string{input} // Fallback to original query
+		}
+
+		emitter(apimodel.EventDebugQuery, apimodel.DebugQueryPayload{
+			OriginalQuery:    input,
+			RewrittenQueries: queries,
+			Timestamp:        time.Now().UnixMilli(),
+		})
+
+		emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
+			StepID:    "query_rewrite",
+			StepName:  "QueryRewriter",
+			Component: apimodel.ComponentQueryRewriter,
+			Status:    apimodel.StatusCompleted,
+			Output:    map[string]interface{}{"queries_count": len(queries)},
+			Timestamp: time.Now().UnixMilli(),
+		})
+
+		// Step 3: Parallel retrieval
+		emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
+			StepID:    "retrieval",
+			StepName:  "Retriever",
+			Component: apimodel.ComponentRetriever,
+			Status:    apimodel.StatusStarted,
+			Input:     map[string]interface{}{"queries": queries},
+			Timestamp: time.Now().UnixMilli(),
+		})
+
+		docs = c.retrieveWithDebug(ctx, queries, emitter)
+
+		emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
+			StepID:    "retrieval",
+			StepName:  "Retriever",
+			Component: apimodel.ComponentRetriever,
+			Status:    apimodel.StatusCompleted,
+			Output:    map[string]interface{}{"total_documents": len(docs)},
+			Timestamp: time.Now().UnixMilli(),
+		})
 	}
-
-	emitter(apimodel.EventDebugQuery, apimodel.DebugQueryPayload{
-		OriginalQuery:    input,
-		RewrittenQueries: queries,
-		Timestamp:        time.Now().UnixMilli(),
-	})
-
-	emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
-		StepID:    "query_rewrite",
-		StepName:  "QueryRewriter",
-		Component: apimodel.ComponentQueryRewriter,
-		Status:    apimodel.StatusCompleted,
-		Output:    map[string]interface{}{"queries_count": len(queries)},
-		Timestamp: time.Now().UnixMilli(),
-	})
-
-	// Step 3: Parallel retrieval
-	emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
-		StepID:    "retrieval",
-		StepName:  "Retriever",
-		Component: apimodel.ComponentRetriever,
-		Status:    apimodel.StatusStarted,
-		Input:     map[string]interface{}{"queries": queries},
-		Timestamp: time.Now().UnixMilli(),
-	})
-
-	docs := c.retrieveWithDebug(ctx, queries, emitter)
-
-	emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
-		StepID:    "retrieval",
-		StepName:  "Retriever",
-		Component: apimodel.ComponentRetriever,
-		Status:    apimodel.StatusCompleted,
-		Output:    map[string]interface{}{"total_documents": len(docs)},
-		Timestamp: time.Now().UnixMilli(),
-	})
 
 	// Step 4: Build context and generate response
 	systemPrompt := c.buildRAGSystemPrompt(session.SystemPrompt, plan, docs)

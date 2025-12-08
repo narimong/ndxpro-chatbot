@@ -30,11 +30,13 @@ type FullTextSearchResult struct {
 
 // NodeCandidate represents a candidate node from search
 type NodeCandidate struct {
-	UUID       string         `json:"uuid"`
-	Labels     []string       `json:"labels"`
-	Name       string         `json:"name"`
-	Properties map[string]any `json:"properties"`
-	Score      float64        `json:"score"`
+	UUID            string            `json:"uuid"`
+	Labels          []string          `json:"labels"`
+	Name            string            `json:"name"`
+	Properties      map[string]any    `json:"properties"`
+	Score           float64           `json:"score"`
+	VariantInfo     *db.VariantInfo   `json:"variant_info,omitempty"`     // Variant info (engine, trim, year)
+	NeighborSummary []db.NeighborInfo `json:"neighbor_summary,omitempty"` // 1-hop neighbor info for generic context
 }
 
 // NewNeo4jFullTextSearchTool creates a new full-text search tool
@@ -109,6 +111,8 @@ func (t *Neo4jFullTextSearchTool) InvokableRun(ctx context.Context, argumentsInJ
 		}
 		if props, ok := r["properties"].(map[string]any); ok {
 			candidate.Properties = props
+			// Extract variant info from properties
+			candidate.VariantInfo = db.ExtractVariantInfo(props)
 		}
 
 		candidates = append(candidates, candidate)

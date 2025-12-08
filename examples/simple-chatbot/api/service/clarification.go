@@ -440,7 +440,8 @@ func (s *ClarificationService) BuildTargetLabelRequest(
 }
 
 // candidatesToOptions converts node candidates to clarification options
-// Now includes label type in the display for clarity (e.g., "[경쟁 차량] POLO")
+// Now includes label type and variant info for clarity
+// e.g., "[경쟁 차량] Tucson (1.6T HEV, Premium, 2024)"
 func (s *ClarificationService) candidatesToOptions(candidates []tools.NodeCandidate) []ClarificationOpt {
 	options := make([]ClarificationOpt, 0, min(6, len(candidates)))
 	for i, c := range candidates {
@@ -454,20 +455,106 @@ func (s *ClarificationService) candidatesToOptions(candidates []tools.NodeCandid
 			labelDisplayName = db.GetLabelDisplayName(c.Labels[0])
 		}
 
-		// Format: "[라벨타입] 이름" (e.g., "[경쟁 차량] POLO")
-		displayLabel := c.Name
-		if labelDisplayName != "" && labelDisplayName != c.Labels[0] {
-			displayLabel = fmt.Sprintf("[%s] %s", labelDisplayName, c.Name)
+		// Format with variant info for disambiguation
+		displayLabel := s.formatCandidateDisplay(c, labelDisplayName)
+
+		// Build description with score and labels
+		description := fmt.Sprintf("점수: %.2f", c.Score)
+		if len(c.Labels) > 0 {
+			description += fmt.Sprintf(" (%s)", strings.Join(c.Labels, ", "))
 		}
 
 		options = append(options, ClarificationOpt{
 			ID:          fmt.Sprintf("node_%d", i+1),
 			Label:       displayLabel,
-			Description: fmt.Sprintf("점수: %.2f (%s)", c.Score, strings.Join(c.Labels, ", ")),
+			Description: description,
 			TargetLabel: c.UUID, // Store UUID for later retrieval
 		})
 	}
 	return options
+}
+
+// formatCandidateDisplay creates display string with variant info and 1-hop neighbor context
+// Format: "[라벨타입] 이름 (variant info)" or "[라벨타입] 이름 (1-hop context)"
+// e.g., "[경쟁 차량] Tucson (1.6T gsl MHEV, Prime, 2022)"
+// e.g., "[Engine] 1.6T (브랜드: Hyundai; 연결: 3개 차량)"
+func (s *ClarificationService) formatCandidateDisplay(c tools.NodeCandidate, labelDisplayName string) string {
+	// Base: Name with label prefix
+	displayLabel := c.Name
+	if labelDisplayName != "" && len(c.Labels) > 0 && labelDisplayName != c.Labels[0] {
+		displayLabel = fmt.Sprintf("[%s] %s", labelDisplayName, c.Name)
+	}
+
+	// Collect context parts
+	var contextParts []string
+
+	// 1. Try variant info first (for vehicles)
+	if c.VariantInfo != nil && !c.VariantInfo.IsEmpty() {
+		variantDisplay := c.VariantInfo.FormatDisplay()
+		if variantDisplay != "" {
+			contextParts = append(contextParts, variantDisplay)
+		}
+	} else if c.Properties != nil {
+		// Fallback: Try to extract from Properties directly
+		variantInfo := db.ExtractVariantInfo(c.Properties)
+		if !variantInfo.IsEmpty() {
+			variantDisplay := variantInfo.FormatDisplay()
+			if variantDisplay != "" {
+				contextParts = append(contextParts, variantDisplay)
+			}
+		}
+	}
+
+	// 2. Add 1-hop neighbor summary if variant info is insufficient
+	if len(contextParts) == 0 && len(c.NeighborSummary) > 0 {
+		neighborContext := formatNeighborSummary(c.NeighborSummary)
+		if neighborContext != "" {
+			contextParts = append(contextParts, neighborContext)
+		}
+	}
+
+	// Combine context
+	if len(contextParts) > 0 {
+		displayLabel = fmt.Sprintf("%s (%s)", displayLabel, strings.Join(contextParts, "; "))
+	}
+
+	return displayLabel
+}
+
+// formatNeighborSummary creates a brief description from neighbor info
+// e.g., "엔진: 1.6T; 연결: PerformanceTotalScore"
+func formatNeighborSummary(neighbors []db.NeighborInfo) string {
+	if len(neighbors) == 0 {
+		return ""
+	}
+
+	// Group by relationship type
+	relMap := make(map[string][]string)
+	for _, n := range neighbors {
+		if n.Name != "" {
+			relMap[n.Relationship] = append(relMap[n.Relationship], n.Name)
+		}
+	}
+
+	// Format: "관계: 이름들"
+	parts := make([]string, 0)
+	for rel, names := range relMap {
+		displayRel := db.GetRelationshipDisplayName(rel)
+		if len(names) == 1 {
+			parts = append(parts, fmt.Sprintf("%s: %s", displayRel, names[0]))
+		} else if len(names) <= 3 {
+			parts = append(parts, fmt.Sprintf("%s: %s", displayRel, strings.Join(names, ", ")))
+		} else {
+			parts = append(parts, fmt.Sprintf("%s: %s 외 %d개", displayRel, names[0], len(names)-1))
+		}
+	}
+
+	// Limit to 2 relationship types for readability
+	if len(parts) > 2 {
+		parts = parts[:2]
+	}
+
+	return strings.Join(parts, "; ")
 }
 
 // getPopularVehicleOptions gets popular vehicles from the database
