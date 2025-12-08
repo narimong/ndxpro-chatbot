@@ -190,7 +190,8 @@ func (h *SocketIOHandler) handleChat(socket *socketio.Socket, event *socketio.Ev
 
 	if err != nil {
 		// Check if this is a clarification request (not an actual error)
-		if err.Error() == "clarification_required" {
+		errMsg := err.Error()
+		if errMsg == "clarification_required" || errMsg == "comparison_clarification_required" {
 			// Store the pending clarification request for response handling
 			if pendingClarificationReq != nil {
 				h.pendingClarificationRequests.Store(sessionID, pendingClarificationReq)
@@ -293,7 +294,21 @@ func (h *SocketIOHandler) handleClarificationResponse(socket *socketio.Socket, e
 		return
 	}
 
-	// Parse clarification response
+	// Check if debug mode is enabled
+	debugMode := false
+	if debug, ok := data["debug"].(bool); ok {
+		debugMode = debug
+	}
+
+	// Check if this is a comparison clarification by looking at session state
+	comparisonPending := h.sessionStore.GetPendingComparisonClarification(sessionID)
+	if comparisonPending != nil {
+		// Route to comparison clarification handler
+		h.handleComparisonClarificationResponse(socket, sessionID, data, debugMode)
+		return
+	}
+
+	// Parse standard clarification response
 	response := &service.ClarificationResponse{}
 
 	if requestID, ok := data["request_id"].(string); ok {
@@ -304,12 +319,6 @@ func (h *SocketIOHandler) handleClarificationResponse(socket *socketio.Socket, e
 	}
 	if freeText, ok := data["free_text"].(string); ok {
 		response.FreeText = freeText
-	}
-
-	// Check if debug mode is enabled
-	debugMode := false
-	if debug, ok := data["debug"].(bool); ok {
-		debugMode = debug
 	}
 
 	// Get the pending clarification request
@@ -389,6 +398,136 @@ func (h *SocketIOHandler) handleClarificationResponse(socket *socketio.Socket, e
 
 	// Clear pending clarification from session
 	h.sessionStore.ClearPendingClarification(sessionID)
+
+	socket.Emit("done", map[string]string{
+		"message_id":   messageID,
+		"full_content": fullContent.String(),
+	})
+}
+
+// handleComparisonClarificationResponse handles user's response to a comparison clarification request
+func (h *SocketIOHandler) handleComparisonClarificationResponse(socket *socketio.Socket, sessionID string, data map[string]interface{}, debugMode bool) {
+	// Parse comparison-specific fields
+	var selectedIndex int
+	var selectedUUID, selectedName string
+
+	if idx, ok := data["selected_index"].(float64); ok {
+		selectedIndex = int(idx)
+	}
+	if id, ok := data["selected_id"].(string); ok {
+		selectedUUID = id
+	}
+	if name, ok := data["selected_name"].(string); ok {
+		selectedName = name
+	}
+
+	// If selected_name is not provided, try to get it from selected_id (label field in ClarificationOpt)
+	if selectedName == "" && selectedUUID != "" {
+		// Try to find the name from pending request options
+		if pendingReqVal, ok := h.pendingClarificationRequests.Load(sessionID); ok {
+			if pendingReq, ok := pendingReqVal.(*service.ClarificationRequest); ok {
+				for _, opt := range pendingReq.Options {
+					if opt.ID == selectedUUID {
+						selectedName = opt.Label
+						break
+					}
+				}
+			}
+		}
+	}
+
+	log.Printf("[DEBUG] Comparison clarification response: index=%d, uuid=%s, name=%s", selectedIndex, selectedUUID, selectedName)
+
+	// Clear the pending standard clarification request (it was converted from comparison)
+	h.pendingClarificationRequests.Delete(sessionID)
+
+	ctx := context.Background()
+	messageID := uuid.New().String()
+
+	var streamReader *schema.StreamReader[*schema.Message]
+	var err error
+	var pendingClarificationReq *service.ClarificationRequest
+
+	emitter := func(event string, eventData interface{}) {
+		socket.Emit(event, eventData)
+		// Store clarification request if emitted (for next entity)
+		if event == "clarification:request" {
+			if req, ok := eventData.(*service.ClarificationRequest); ok {
+				pendingClarificationReq = req
+				log.Printf("[DEBUG] Stored next comparison clarification request: %s", req.RequestID)
+			}
+		}
+	}
+
+	// Process comparison clarification response
+	streamReader, err = h.chatService.ProcessComparisonClarificationResponse(
+		ctx, sessionID, selectedIndex, selectedUUID, selectedName, emitter,
+	)
+
+	if err != nil {
+		errMsg := err.Error()
+		// Check if more clarification is needed for next entity
+		if errMsg == "comparison_clarification_required" {
+			// Store the new pending clarification request for next response
+			if pendingClarificationReq != nil {
+				h.pendingClarificationRequests.Store(sessionID, pendingClarificationReq)
+			}
+			// The clarification request was already emitted via emitter
+			// Don't send an error - client will handle clarification:request event
+			log.Printf("[DEBUG] More comparison clarification needed, waiting for next entity selection")
+			return
+		}
+
+		socket.Emit("error", map[string]string{
+			"code":    "COMPARISON_CLARIFICATION_ERROR",
+			"message": err.Error(),
+		})
+		return
+	}
+	defer streamReader.Close()
+
+	var fullContent strings.Builder
+
+	for {
+		chunk, err := streamReader.Recv()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			socket.Emit("error", map[string]string{
+				"code":    "STREAM_ERROR",
+				"message": err.Error(),
+			})
+			return
+		}
+
+		if chunk.Content != "" {
+			fullContent.WriteString(chunk.Content)
+			socket.Emit("chunk", map[string]string{
+				"content":    chunk.Content,
+				"message_id": messageID,
+			})
+		}
+	}
+
+	// Get original query from comparison pending state (before it was cleared)
+	originalQuery := ""
+	if comparisonPending := h.sessionStore.GetPendingComparisonClarification(sessionID); comparisonPending != nil {
+		originalQuery = comparisonPending.OriginalQuery
+	}
+
+	// Append to history
+	if originalQuery != "" && fullContent.Len() > 0 {
+		if err := h.sessionStore.AppendHistory(sessionID,
+			schema.UserMessage(originalQuery),
+			schema.AssistantMessage(fullContent.String(), nil),
+		); err != nil {
+			log.Printf("Failed to append history: %v", err)
+		}
+	}
+
+	// Clear pending comparison clarification from session (it should already be cleared by service)
+	h.sessionStore.ClearPendingComparisonClarification(sessionID)
 
 	socket.Emit("done", map[string]string{
 		"message_id":   messageID,

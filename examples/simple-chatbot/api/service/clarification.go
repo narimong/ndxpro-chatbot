@@ -478,11 +478,15 @@ func (s *ClarificationService) candidatesToOptions(candidates []tools.NodeCandid
 // Format: "[라벨타입] 이름 (variant info)" or "[라벨타입] 이름 (1-hop context)"
 // e.g., "[경쟁 차량] Tucson (1.6T gsl MHEV, Prime, 2022)"
 // e.g., "[Engine] 1.6T (브랜드: Hyundai; 연결: 3개 차량)"
+// e.g., "[Part] OPENING EQUIPMENT-REAR DOOR (type: Assembly)"
 func (s *ClarificationService) formatCandidateDisplay(c tools.NodeCandidate, labelDisplayName string) string {
 	// Base: Name with label prefix
 	displayLabel := c.Name
-	if labelDisplayName != "" && len(c.Labels) > 0 && labelDisplayName != c.Labels[0] {
+	if labelDisplayName != "" {
 		displayLabel = fmt.Sprintf("[%s] %s", labelDisplayName, c.Name)
+	} else if len(c.Labels) > 0 {
+		// Use raw label if no display name available
+		displayLabel = fmt.Sprintf("[%s] %s", c.Labels[0], c.Name)
 	}
 
 	// Collect context parts
@@ -505,7 +509,15 @@ func (s *ClarificationService) formatCandidateDisplay(c tools.NodeCandidate, lab
 		}
 	}
 
-	// 2. Add 1-hop neighbor summary if variant info is insufficient
+	// 2. If still no context, try extracting from generic properties
+	if len(contextParts) == 0 && c.Properties != nil {
+		genericContext := extractGenericContext(c.Properties)
+		if genericContext != "" {
+			contextParts = append(contextParts, genericContext)
+		}
+	}
+
+	// 3. Add 1-hop neighbor summary if still no context
 	if len(contextParts) == 0 && len(c.NeighborSummary) > 0 {
 		neighborContext := formatNeighborSummary(c.NeighborSummary)
 		if neighborContext != "" {
@@ -596,4 +608,51 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// extractGenericContext extracts context from generic node properties
+// Looks for common descriptive properties like type, category, description, etc.
+// Returns a formatted string like "type: Assembly" or "category: Electrical"
+func extractGenericContext(props map[string]any) string {
+	if props == nil {
+		return ""
+	}
+
+	// Priority order for context extraction
+	contextKeys := []string{
+		"type",
+		"category",
+		"part_type",
+		"component_type",
+		"description",
+		"desc",
+		"class",
+		"group",
+		"kind",
+		"status",
+	}
+
+	var contextParts []string
+	for _, key := range contextKeys {
+		if val, ok := props[key]; ok {
+			var strVal string
+			switch v := val.(type) {
+			case string:
+				strVal = v
+			case fmt.Stringer:
+				strVal = v.String()
+			default:
+				strVal = fmt.Sprintf("%v", v)
+			}
+
+			if strVal != "" && len(strVal) <= 50 { // Limit length for display
+				contextParts = append(contextParts, fmt.Sprintf("%s: %s", key, strVal))
+				if len(contextParts) >= 2 { // Limit to 2 properties
+					break
+				}
+			}
+		}
+	}
+
+	return strings.Join(contextParts, ", ")
 }

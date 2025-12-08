@@ -597,10 +597,16 @@ body {
     margin: 16px;
     overflow: hidden;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    position: sticky;
+    bottom: 0;
+    z-index: 100;
+    flex-shrink: 0;
 }
 
 .clarification-content {
     padding: 16px;
+    max-height: 400px;
+    overflow-y: auto;
 }
 
 .clarification-header {
@@ -630,6 +636,8 @@ body {
     display: flex;
     flex-direction: column;
     gap: 8px;
+    max-height: 200px;
+    overflow-y: auto;
 }
 
 .clarification-option-btn {
