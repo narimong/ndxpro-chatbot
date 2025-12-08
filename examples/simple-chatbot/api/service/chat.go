@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -16,14 +17,43 @@ import (
 
 	"simple-chatbot/api/config"
 	apimodel "simple-chatbot/api/model"
+	"simple-chatbot/api/service/db"
 )
 
 const (
 	defaultSystemPrompt = "You are a helpful assistant. Answer questions concisely and clearly."
 
 	ragSystemPrompt = `You are a helpful assistant with access to relevant documents.
-Use the following context to answer the user's question. If the context doesn't contain
-relevant information, say so and answer based on your general knowledge.
+Use the following context to answer the user's question accurately and completely.
+
+IMPORTANT FORMATTING GUIDELINES:
+1. When presenting hierarchical data (scores, categories, etc.):
+   - Use markdown tables for structured data
+   - Show parent-child relationships clearly
+   - Include both values AND maximum scores (e.g., "84/125점")
+   - Calculate and show percentages for scores when possible
+   - Highlight exceptional scores (최고/최저) with ★
+
+2. For score breakdowns:
+   - Start with the top-level summary
+   - Then show each category with its sub-scores
+   - Group related items together
+   - Use bullet points for individual scores
+
+3. Example format for vehicle performance scores:
+   | 카테고리 | 점수 | 만점 | 비율 |
+   |----------|------|------|------|
+   | PT총점 | 84 | 125 | 67.2%% |
+   | 컴포트총점 | 114 | 150 | 76.0%% |
+
+   **PT총점 세부 (84/125점)**:
+   - 발진가속: 11/15 | 추월성능: 11/15 | 최고속도: 3/5
+   - 충전/주유: 15/15 ★ (최고점)
+
+4. Always provide complete information when the context contains it.
+   If the user asks for "모든 하위 점수" or "세부 점수", include ALL available sub-scores.
+
+5. If the context doesn't contain relevant information, clearly state what's missing.
 
 %s
 
@@ -45,6 +75,7 @@ type ChatService struct {
 	retriever    retriever.Retriever
 	planner      *PlannerService
 	sessionStore *SessionStore
+	neo4jClient  *db.Neo4jClient
 	debugEnabled bool
 }
 
@@ -73,18 +104,55 @@ func NewChatService(ctx context.Context, cfg *config.Config, sessionStore *Sessi
 		return nil, err
 	}
 
-	// Create mock retriever for demonstration
-	mockRetriever := NewMockRetriever()
-
 	// Create planner service
 	planner := NewPlannerService(chatModel)
+
+	// Initialize retriever based on config
+	var activeRetriever retriever.Retriever
+	var neo4jClient *db.Neo4jClient
+
+	if cfg.GraphRAGEnabled {
+		// Try to connect to Neo4j and create GraphRAGRetriever
+		neo4jClient, err = db.NewNeo4jClient(ctx, cfg.Neo4jURI, cfg.Neo4jUsername, cfg.Neo4jPassword)
+		if err != nil {
+			log.Printf("Warning: Failed to connect to Neo4j: %v. Falling back to MockRetriever.", err)
+			activeRetriever = NewMockRetriever()
+		} else {
+			// Ensure Full-Text index exists
+			if err := neo4jClient.EnsureFullTextIndex(ctx); err != nil {
+				log.Printf("Warning: Failed to ensure Full-Text index: %v", err)
+			}
+
+			// Create GraphRAGRetriever with shortest path support
+			graphRAG, err := NewGraphRAGRetriever(&GraphRAGConfig{
+				Neo4jClient:        neo4jClient,
+				ChatModel:          chatModel,
+				DefaultTopK:        cfg.DefaultGraphDepth,
+				MaxGraphDepth:      cfg.DefaultGraphDepth,
+				EnableReranking:    true,
+				EnableShortestPath: true, // Enable shortest path navigation
+			})
+			if err != nil {
+				log.Printf("Warning: Failed to create GraphRAGRetriever: %v. Falling back to MockRetriever.", err)
+				activeRetriever = NewMockRetriever()
+			} else {
+				activeRetriever = graphRAG
+				log.Printf("GraphRAGRetriever initialized successfully with Neo4j at %s", cfg.Neo4jURI)
+			}
+		}
+	} else {
+		// Use mock retriever when Graph RAG is disabled
+		activeRetriever = NewMockRetriever()
+		log.Println("Using MockRetriever (Graph RAG disabled)")
+	}
 
 	return &ChatService{
 		chain:        chain,
 		chatModel:    chatModel,
-		retriever:    mockRetriever,
+		retriever:    activeRetriever,
 		planner:      planner,
 		sessionStore: sessionStore,
+		neo4jClient:  neo4jClient,
 		debugEnabled: true,
 	}, nil
 }
@@ -405,5 +473,195 @@ func (c *ChatService) Chat(ctx context.Context, sessionID, input string) (*schem
 		"system_prompt": systemPrompt,
 		"history":       session.History,
 		"input":         input,
+	})
+}
+
+// CheckClarificationNeeded analyzes a query and returns clarification request if needed
+func (c *ChatService) CheckClarificationNeeded(ctx context.Context, query, requestID string) (*ClarificationRequest, error) {
+	graphRAG, ok := c.retriever.(*GraphRAGRetriever)
+	if !ok || graphRAG.GetClarificationService() == nil {
+		return nil, nil // No clarification service available
+	}
+
+	clarificationSvc := graphRAG.GetClarificationService()
+
+	// First, try to find a source node
+	sourceUUID := ""
+	docs, err := c.retriever.Retrieve(ctx, query, retriever.WithTopK(1))
+	if err == nil && len(docs) > 0 {
+		if uuid, ok := docs[0].MetaData["source_uuid"].(string); ok {
+			sourceUUID = uuid
+		} else {
+			sourceUUID = docs[0].ID
+		}
+	}
+
+	_, clarificationReq, err := clarificationSvc.AnalyzeAndClarify(ctx, query, sourceUUID, requestID)
+	if err != nil {
+		return nil, err
+	}
+
+	return clarificationReq, nil
+}
+
+// ResolveClarification resolves a clarification response and retrieves documents
+func (c *ChatService) ResolveClarification(ctx context.Context, req *ClarificationRequest, resp *ClarificationResponse) ([]*schema.Document, error) {
+	graphRAG, ok := c.retriever.(*GraphRAGRetriever)
+	if !ok || graphRAG.GetClarificationService() == nil {
+		return nil, fmt.Errorf("clarification service not available")
+	}
+
+	clarificationSvc := graphRAG.GetClarificationService()
+
+	// Resolve clarification to get target labels
+	result, err := clarificationSvc.ResolveClarification(ctx, req, resp)
+	if err != nil {
+		return nil, err
+	}
+
+	// Retrieve with resolved target labels
+	if len(result.TargetLabels) > 0 {
+		return graphRAG.RetrieveWithTargetLabels(ctx, result.RefinedQuery, result.TargetLabels, 5)
+	}
+
+	// Fallback to regular retrieval with refined query
+	return c.retriever.Retrieve(ctx, result.RefinedQuery, retriever.WithTopK(5))
+}
+
+// GetGraphRAGRetriever returns the GraphRAG retriever if available
+func (c *ChatService) GetGraphRAGRetriever() *GraphRAGRetriever {
+	if graphRAG, ok := c.retriever.(*GraphRAGRetriever); ok {
+		return graphRAG
+	}
+	return nil
+}
+
+// ProcessClarificationResponse processes the user's clarification response and returns a stream
+func (c *ChatService) ProcessClarificationResponse(
+	ctx context.Context,
+	sessionID string,
+	resp *ClarificationResponse,
+	pendingReq *ClarificationRequest,
+) (*schema.StreamReader[*schema.Message], error) {
+	return c.processClarificationResponseInternal(ctx, sessionID, resp, pendingReq, nil)
+}
+
+// ProcessClarificationResponseWithDebug processes clarification response with debug events
+func (c *ChatService) ProcessClarificationResponseWithDebug(
+	ctx context.Context,
+	sessionID string,
+	resp *ClarificationResponse,
+	pendingReq *ClarificationRequest,
+	emitter DebugEmitter,
+) (*schema.StreamReader[*schema.Message], error) {
+	return c.processClarificationResponseInternal(ctx, sessionID, resp, pendingReq, emitter)
+}
+
+// processClarificationResponseInternal is the internal implementation
+func (c *ChatService) processClarificationResponseInternal(
+	ctx context.Context,
+	sessionID string,
+	resp *ClarificationResponse,
+	pendingReq *ClarificationRequest,
+	emitter DebugEmitter,
+) (*schema.StreamReader[*schema.Message], error) {
+	session, err := c.sessionStore.Get(sessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get pending clarification from session
+	pending, err := c.sessionStore.GetPendingClarification(sessionID)
+	if err != nil || pending == nil {
+		return nil, fmt.Errorf("no pending clarification for session")
+	}
+
+	// Get the orchestrator
+	graphRAG := c.GetGraphRAGRetriever()
+	if graphRAG == nil {
+		return nil, fmt.Errorf("GraphRAG retriever not available")
+	}
+
+	clarificationSvc := graphRAG.GetClarificationService()
+	if clarificationSvc == nil {
+		return nil, fmt.Errorf("clarification service not available")
+	}
+
+	// Create orchestrator
+	orchestrator := NewClarificationOrchestrator(&ClarificationOrchestratorConfig{
+		ClarificationService: clarificationSvc,
+		GraphRAGRetriever:    graphRAG,
+		Neo4jClient:          c.neo4jClient,
+		DebugEmitter:         emitter,
+	})
+
+	// Process clarification response
+	if emitter != nil {
+		emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
+			StepID:    "clarification_resolve",
+			StepName:  "ClarificationResolver",
+			Component: "clarification",
+			Status:    apimodel.StatusStarted,
+			Input: map[string]interface{}{
+				"selected_id": resp.SelectedID,
+				"free_text":   resp.FreeText,
+			},
+			Timestamp: time.Now().UnixMilli(),
+		})
+	}
+
+	decision, err := orchestrator.ProcessClarificationResponse(ctx, pending, resp.SelectedID, resp.FreeText, pendingReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to process clarification response: %w", err)
+	}
+
+	if emitter != nil {
+		emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
+			StepID:    "clarification_resolve",
+			StepName:  "ClarificationResolver",
+			Component: "clarification",
+			Status:    apimodel.StatusCompleted,
+			Output: map[string]interface{}{
+				"needs_clarification": decision.NeedsClarification,
+				"documents_count":     len(decision.Documents),
+			},
+			Timestamp: time.Now().UnixMilli(),
+		})
+	}
+
+	// If still needs clarification (Phase 2), return error for now
+	// In a more complete implementation, we would emit a new clarification request
+	if decision.NeedsClarification {
+		return nil, fmt.Errorf("additional clarification needed: %s", decision.ClarificationRequest.Reason)
+	}
+
+	// Build context from retrieved documents
+	systemPrompt := c.buildRAGSystemPrompt(session.SystemPrompt, nil, decision.Documents)
+
+	// Stream response
+	return c.chain.Stream(ctx, map[string]any{
+		"system_prompt": systemPrompt,
+		"history":       session.History,
+		"input":         pending.OriginalQuery,
+	})
+}
+
+// GetClarificationOrchestrator creates and returns a clarification orchestrator
+func (c *ChatService) GetClarificationOrchestrator(emitter DebugEmitter) *ClarificationOrchestrator {
+	graphRAG := c.GetGraphRAGRetriever()
+	if graphRAG == nil {
+		return nil
+	}
+
+	clarificationSvc := graphRAG.GetClarificationService()
+	if clarificationSvc == nil {
+		return nil
+	}
+
+	return NewClarificationOrchestrator(&ClarificationOrchestratorConfig{
+		ClarificationService: clarificationSvc,
+		GraphRAGRetriever:    graphRAG,
+		Neo4jClient:          c.neo4jClient,
+		DebugEmitter:         emitter,
 	})
 }

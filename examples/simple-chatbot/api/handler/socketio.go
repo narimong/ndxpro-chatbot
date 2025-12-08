@@ -22,6 +22,8 @@ type SocketIOHandler struct {
 	sessionStore   *service.SessionStore
 	chatService    *service.ChatService
 	socketSessions sync.Map // socketId -> sessionId
+	// Store pending clarification requests per session for response handling
+	pendingClarificationRequests sync.Map // sessionId -> *service.ClarificationRequest
 }
 
 func NewSocketIOHandler(sessionStore *service.SessionStore, chatService *service.ChatService) *SocketIOHandler {
@@ -51,6 +53,11 @@ func (h *SocketIOHandler) setup() {
 
 		socket.On("clear", func(event *socketio.EventPayload) {
 			h.handleClear(socket)
+		})
+
+		// Clarification response handler
+		socket.On("clarification:response", func(event *socketio.EventPayload) {
+			h.handleClarificationResponse(socket, event)
 		})
 
 		socket.On("disconnect", func(event *socketio.EventPayload) {
@@ -234,6 +241,142 @@ func (h *SocketIOHandler) handleClear(socket *socketio.Socket) {
 		return
 	}
 	socket.Emit("cleared", nil)
+}
+
+// handleClarificationResponse handles user's response to a clarification request
+func (h *SocketIOHandler) handleClarificationResponse(socket *socketio.Socket, event *socketio.EventPayload) {
+	sessionID, ok := h.getSessionID(socket)
+	if !ok {
+		socket.Emit("error", map[string]string{
+			"code":    "NOT_JOINED",
+			"message": "Please join a session first",
+		})
+		return
+	}
+
+	if len(event.Data) == 0 {
+		socket.Emit("error", map[string]string{
+			"code":    "INVALID_MESSAGE",
+			"message": "Empty clarification response",
+		})
+		return
+	}
+
+	data, ok := event.Data[0].(map[string]interface{})
+	if !ok {
+		socket.Emit("error", map[string]string{
+			"code":    "INVALID_MESSAGE",
+			"message": "Invalid message format",
+		})
+		return
+	}
+
+	// Parse clarification response
+	response := &service.ClarificationResponse{}
+
+	if requestID, ok := data["request_id"].(string); ok {
+		response.RequestID = requestID
+	}
+	if selectedID, ok := data["selected_id"].(string); ok {
+		response.SelectedID = selectedID
+	}
+	if freeText, ok := data["free_text"].(string); ok {
+		response.FreeText = freeText
+	}
+
+	// Check if debug mode is enabled
+	debugMode := false
+	if debug, ok := data["debug"].(bool); ok {
+		debugMode = debug
+	}
+
+	// Get the pending clarification request
+	pendingReqVal, ok := h.pendingClarificationRequests.Load(sessionID)
+	if !ok {
+		socket.Emit("error", map[string]string{
+			"code":    "NO_PENDING_CLARIFICATION",
+			"message": "No pending clarification request for this session",
+		})
+		return
+	}
+	pendingReq := pendingReqVal.(*service.ClarificationRequest)
+
+	// Clear the pending request
+	h.pendingClarificationRequests.Delete(sessionID)
+
+	ctx := context.Background()
+	messageID := uuid.New().String()
+
+	// Process clarification response through chat service
+	var streamReader *schema.StreamReader[*schema.Message]
+	var err error
+
+	if debugMode {
+		emitter := func(event string, eventData interface{}) {
+			socket.Emit(event, eventData)
+		}
+		streamReader, err = h.chatService.ProcessClarificationResponseWithDebug(
+			ctx, sessionID, response, pendingReq, emitter,
+		)
+	} else {
+		streamReader, err = h.chatService.ProcessClarificationResponse(
+			ctx, sessionID, response, pendingReq,
+		)
+	}
+
+	if err != nil {
+		socket.Emit("error", map[string]string{
+			"code":    "CLARIFICATION_ERROR",
+			"message": err.Error(),
+		})
+		return
+	}
+	defer streamReader.Close()
+
+	var fullContent strings.Builder
+
+	for {
+		chunk, err := streamReader.Recv()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			socket.Emit("error", map[string]string{
+				"code":    "STREAM_ERROR",
+				"message": err.Error(),
+			})
+			return
+		}
+
+		if chunk.Content != "" {
+			fullContent.WriteString(chunk.Content)
+			socket.Emit("chunk", map[string]string{
+				"content":    chunk.Content,
+				"message_id": messageID,
+			})
+		}
+	}
+
+	// Append to history - the original query and the final response
+	if err := h.sessionStore.AppendHistory(sessionID,
+		schema.UserMessage(pendingReq.OriginalQuery),
+		schema.AssistantMessage(fullContent.String(), nil),
+	); err != nil {
+		log.Printf("Failed to append history: %v", err)
+	}
+
+	// Clear pending clarification from session
+	h.sessionStore.ClearPendingClarification(sessionID)
+
+	socket.Emit("done", map[string]string{
+		"message_id":   messageID,
+		"full_content": fullContent.String(),
+	})
+}
+
+// StorePendingClarificationRequest stores a clarification request for later response handling
+func (h *SocketIOHandler) StorePendingClarificationRequest(sessionID string, req *service.ClarificationRequest) {
+	h.pendingClarificationRequests.Store(sessionID, req)
 }
 
 func (h *SocketIOHandler) Handler() http.Handler {
