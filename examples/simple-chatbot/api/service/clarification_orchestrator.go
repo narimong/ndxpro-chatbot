@@ -70,6 +70,11 @@ func (o *ClarificationOrchestrator) ProcessQuery(
 		return o.processPhase2(ctx, query, pending)
 	}
 
+	// Handle pending label listing clarification
+	if pending != nil && pending.Phase == model.PhaseLabelListing {
+		return o.processLabelListingPending(ctx, pending)
+	}
+
 	// Step 1: Query Analysis
 	o.emitDebug(DebugEvent{
 		Type:    DebugEventStep,
@@ -94,10 +99,39 @@ func (o *ClarificationOrchestrator) ProcessQuery(
 
 	o.emitDebug(DebugEvent{
 		Type:    DebugEventPlan,
-		Message: fmt.Sprintf("Analysis: confidence=%.2f, start_keywords=%v, target_labels=%v",
-			analysis.Confidence, analysis.StartEntity.Keywords, analysis.Target.ExpectedLabels),
+		Message: fmt.Sprintf("Analysis: confidence=%.2f, start_keywords=%v, target_labels=%v, is_label_listing=%v",
+			analysis.Confidence, analysis.StartEntity.Keywords, analysis.Target.ExpectedLabels, analysis.IsLabelListing),
 		Data: map[string]any{"analysis": analysis},
 	})
+
+	// NEW: Check for label listing query FIRST (highest priority)
+	// Label listing queries require label selection clarification
+	if analysis.IsLabelListing {
+		o.emitDebug(DebugEvent{
+			Type:    DebugEventStep,
+			Message: "Label listing query detected - handling clarification",
+			Data: map[string]any{
+				"listing_labels":  analysis.ListingLabels,
+				"resolved_labels": analysis.ResolvedLabels,
+			},
+		})
+		return o.handleLabelListingClarification(ctx, query, analysis)
+	}
+
+	// NEW: Check for conditional query (e.g., "Honda가 생산한 경쟁차 List")
+	// This uses exploration-first approach: find anchor -> explore relations -> traverse
+	if analysis.IsConditionalQuery && analysis.ConditionalAnchor != nil {
+		o.emitDebug(DebugEvent{
+			Type:    DebugEventStep,
+			Message: "Conditional query detected - handling with exploration-first approach",
+			Data: map[string]any{
+				"anchor":        analysis.ConditionalAnchor.Keywords,
+				"condition":     analysis.ConditionalAnchor.ConditionType,
+				"target_labels": analysis.Target.ExpectedLabels,
+			},
+		})
+		return o.handleConditionalQuery(ctx, query, analysis)
+	}
 
 	// Step 2: Check Phase 1 - Initial Node Clarification
 	needsInitialNode, candidates := o.checkInitialNodeClarification(ctx, analysis, query)
@@ -113,7 +147,7 @@ func (o *ClarificationOrchestrator) ProcessQuery(
 	})
 
 	// Step 3: Check Phase 2 - Target Label Clarification
-	needsTargetLabel := o.checkTargetLabelClarification(analysis)
+	needsTargetLabel := o.checkTargetLabelClarification(analysis, query)
 	if needsTargetLabel {
 		return o.buildTargetLabelDecision(ctx, query, analysis, sourceNode)
 	}
@@ -135,6 +169,8 @@ func (o *ClarificationOrchestrator) ProcessClarificationResponse(
 		return o.resolveInitialNodeClarification(ctx, pending, selectedID, freeText, originalRequest)
 	case model.PhaseTargetLabel:
 		return o.resolveTargetLabelClarification(ctx, pending, selectedID, freeText, originalRequest)
+	case model.PhaseLabelListing:
+		return o.ResolveLabelListingClarification(ctx, pending, selectedID, freeText, originalRequest)
 	default:
 		return nil, fmt.Errorf("unknown clarification phase: %s", pending.Phase)
 	}
@@ -236,22 +272,63 @@ func (o *ClarificationOrchestrator) hasSameNameVariants(candidates []tools.NodeC
 // detectHierarchicalQuery checks if the query asks for hierarchical/detailed data
 // Keywords like "하위", "세부", "모두", "전체", "상세" indicate hierarchical queries
 func (o *ClarificationOrchestrator) detectHierarchicalQuery(query string) bool {
+	// Keywords that indicate hierarchical/detailed data request
 	hierarchicalKeywords := []string{
-		"하위", "세부", "모두", "전체", "상세",
-		"breakdown", "details", "all", "complete",
+		// Korean hierarchical keywords
+		"하위", "세부", "모두", "전체", "상세", "자세", "구체",
+		"연결", "관련", "포함", "알려", "설명",
+		// English hierarchical keywords
+		"breakdown", "details", "all", "complete", "explain",
+		"nested", "children", "sub-", "hierarchy",
 	}
+
+	// Target keywords that suggest user wants specific data (score, evaluation, etc.)
+	targetKeywords := []string{
+		"점수", "평가", "성능", "스코어",
+		"score", "performance", "evaluation", "rating",
+	}
+
 	queryLower := strings.ToLower(query)
+
+	// Check for hierarchical keywords
 	for _, kw := range hierarchicalKeywords {
 		if strings.Contains(queryLower, kw) {
 			return true
 		}
 	}
+
+	// If query contains target keywords with any descriptive word, treat as wanting detailed info
+	for _, tk := range targetKeywords {
+		if strings.Contains(queryLower, tk) {
+			// User is asking about scores/performance - likely wants detailed breakdown
+			return true
+		}
+	}
+
 	return false
 }
 
 // checkTargetLabelClarification checks if target label clarification is needed
-func (o *ClarificationOrchestrator) checkTargetLabelClarification(analysis *tools.QueryAnalysisOutput) bool {
-	// Case 1: No target labels extracted
+func (o *ClarificationOrchestrator) checkTargetLabelClarification(analysis *tools.QueryAnalysisOutput, query string) bool {
+	// Skip clarification for hierarchical queries - they will explore the graph
+	if analysis.IsHierarchical || o.detectHierarchicalQuery(query) {
+		o.emitDebug(DebugEvent{
+			Type:    DebugEventClarification,
+			Message: "Skipping target label clarification for hierarchical query",
+		})
+		return false
+	}
+
+	// Skip clarification for exploration queries - they don't need specific targets
+	if analysis.QueryType == "exploration" {
+		o.emitDebug(DebugEvent{
+			Type:    DebugEventClarification,
+			Message: "Skipping target label clarification for exploration query",
+		})
+		return false
+	}
+
+	// Case 1: No target labels extracted and not a hierarchical/exploration query
 	if len(analysis.Target.ExpectedLabels) == 0 {
 		o.emitDebug(DebugEvent{
 			Type:    DebugEventClarification,
@@ -260,8 +337,8 @@ func (o *ClarificationOrchestrator) checkTargetLabelClarification(analysis *tool
 		return true
 	}
 
-	// Case 2: Low confidence
-	if analysis.Confidence < 0.5 {
+	// Case 2: Low confidence (but not too low - very low suggests exploration)
+	if analysis.Confidence < 0.5 && analysis.Confidence > 0.2 {
 		o.emitDebug(DebugEvent{
 			Type:    DebugEventClarification,
 			Message: fmt.Sprintf("Low confidence: %.2f < 0.5", analysis.Confidence),
@@ -403,7 +480,7 @@ func (o *ClarificationOrchestrator) resolveInitialNodeClarification(
 	}
 
 	// Check if target label clarification is needed
-	if o.checkTargetLabelClarification(analysis) {
+	if o.checkTargetLabelClarification(analysis, pending.OriginalQuery) {
 		return o.buildTargetLabelDecision(ctx, pending.OriginalQuery, analysis, sourceNode)
 	}
 
@@ -571,7 +648,7 @@ func (o *ClarificationOrchestrator) processPhase2(
 	}
 
 	// Check if target label clarification is needed
-	if o.checkTargetLabelClarification(analysis) {
+	if o.checkTargetLabelClarification(analysis, query) {
 		return o.buildTargetLabelDecision(ctx, query, analysis, sourceNode)
 	}
 
@@ -651,4 +728,304 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// =============================================================================
+// Label Listing Clarification Methods
+// =============================================================================
+
+// handleLabelListingClarification handles clarification for "list all X" queries
+// Always shows clarification options to let user confirm or select the label type
+func (o *ClarificationOrchestrator) handleLabelListingClarification(
+	ctx context.Context,
+	query string,
+	analysis *tools.QueryAnalysisOutput,
+) (*ClarificationDecision, error) {
+	requestID := uuid.New().String()
+
+	// Get all listable labels with counts for options
+	labelOptions, err := o.neo4jClient.GetListableLabelOptions(ctx)
+	if err != nil {
+		o.emitDebug(DebugEvent{
+			Type:    DebugEventStep,
+			Message: fmt.Sprintf("Failed to get listable labels: %v", err),
+		})
+		labelOptions = []db.LabelOption{}
+	}
+
+	// Build clarification options
+	options := make([]ClarificationOpt, 0)
+
+	// If we have resolved labels from semantic mapping, show them first as "suggested"
+	if len(analysis.ResolvedLabels) > 0 {
+		for i, resolved := range analysis.ResolvedLabels {
+			displayName := db.LabelDisplayNames[resolved.ResolvedLabel]
+			if displayName == "" {
+				displayName = resolved.ResolvedLabel
+			}
+
+			// Find count for this label
+			count := 0
+			for _, opt := range labelOptions {
+				if opt.Label == resolved.ResolvedLabel {
+					count = opt.NodeCount
+					break
+				}
+			}
+
+			options = append(options, ClarificationOpt{
+				ID:          fmt.Sprintf("suggested_%d", i),
+				Label:       fmt.Sprintf("%s (%s)", displayName, resolved.ResolvedLabel),
+				Description: fmt.Sprintf("%d개 등록됨 - 추천", count),
+				TargetLabel: resolved.ResolvedLabel,
+			})
+		}
+	}
+
+	// Add related labels (from the same group) if not already in suggestions
+	suggestedLabels := make(map[string]bool)
+	for _, rl := range analysis.ResolvedLabels {
+		suggestedLabels[rl.ResolvedLabel] = true
+		// Add related labels from the same group
+		relatedLabels := db.GetRelatedLabels(rl.ResolvedLabel)
+		for _, related := range relatedLabels {
+			if !suggestedLabels[related] {
+				displayName := db.LabelDisplayNames[related]
+				if displayName == "" {
+					displayName = related
+				}
+				// Find count
+				count := 0
+				for _, opt := range labelOptions {
+					if opt.Label == related {
+						count = opt.NodeCount
+						break
+					}
+				}
+				options = append(options, ClarificationOpt{
+					ID:          fmt.Sprintf("related_%s", related),
+					Label:       fmt.Sprintf("%s (%s)", displayName, related),
+					Description: fmt.Sprintf("%d개 등록됨", count),
+					TargetLabel: related,
+				})
+				suggestedLabels[related] = true
+			}
+		}
+	}
+
+	// Add other listable labels (those not already suggested)
+	for i, opt := range labelOptions {
+		if !suggestedLabels[opt.Label] && opt.NodeCount > 0 {
+			displayName := opt.DisplayName
+			if displayName == "" {
+				displayName = opt.Label
+			}
+			options = append(options, ClarificationOpt{
+				ID:          fmt.Sprintf("other_%d", i),
+				Label:       fmt.Sprintf("%s (%s)", displayName, opt.Label),
+				Description: fmt.Sprintf("%d개 등록됨", opt.NodeCount),
+				TargetLabel: opt.Label,
+			})
+		}
+	}
+
+	// Build reason message
+	var reason string
+	if len(analysis.ResolvedLabels) > 0 {
+		reason = fmt.Sprintf("'%s'에 대해 검색할 항목을 선택해주세요:", analysis.ResolvedLabels[0].OriginalTerm)
+	} else {
+		reason = "검색하고 싶은 항목의 유형을 선택해주세요:"
+	}
+
+	// Extract detected term for pending state
+	detectedTerm := ""
+	if len(analysis.ResolvedLabels) > 0 {
+		detectedTerm = analysis.ResolvedLabels[0].OriginalTerm
+	}
+
+	req := &ClarificationRequest{
+		RequestID:     requestID,
+		OriginalQuery: query,
+		Reason:        reason,
+		Options:       options,
+		AllowFreeText: true,
+	}
+
+	o.emitDebug(DebugEvent{
+		Type:    DebugEventClarification,
+		Message: fmt.Sprintf("Label listing clarification: %d options, detected_term=%s", len(options), detectedTerm),
+		Data:    map[string]any{"options_count": len(options), "detected_term": detectedTerm},
+	})
+
+	return &ClarificationDecision{
+		NeedsClarification:   true,
+		ClarificationRequest: req,
+		Phase:                model.PhaseLabelListing,
+		Analysis:             analysis,
+	}, nil
+}
+
+// processLabelListingPending processes a pending label listing clarification response
+func (o *ClarificationOrchestrator) processLabelListingPending(
+	ctx context.Context,
+	pending *model.PendingClarification,
+) (*ClarificationDecision, error) {
+	// If a label has been selected, proceed with retrieval
+	if pending.SelectedLabel != "" {
+		o.emitDebug(DebugEvent{
+			Type:    DebugEventStep,
+			Message: fmt.Sprintf("Label listing: proceeding with selected label %s", pending.SelectedLabel),
+		})
+
+		docs, err := o.graphRAGRetriever.RetrieveWithLabelListingDirect(
+			ctx,
+			[]string{pending.SelectedLabel},
+			50,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("label listing retrieval failed: %w", err)
+		}
+
+		return &ClarificationDecision{
+			NeedsClarification: false,
+			Documents:          docs,
+		}, nil
+	}
+
+	// No label selected yet - re-trigger clarification
+	queryAnalyzer := o.clarificationSvc.GetQueryAnalyzer()
+	analysis, err := queryAnalyzer.Analyze(ctx, pending.OriginalQuery)
+	if err != nil {
+		return o.fallbackToRegularRetrieval(ctx, pending.OriginalQuery)
+	}
+
+	return o.handleLabelListingClarification(ctx, pending.OriginalQuery, analysis)
+}
+
+// ResolveLabelListingClarification resolves a label listing clarification response
+func (o *ClarificationOrchestrator) ResolveLabelListingClarification(
+	ctx context.Context,
+	pending *model.PendingClarification,
+	selectedID string,
+	freeText string,
+	originalRequest *ClarificationRequest,
+) (*ClarificationDecision, error) {
+	var selectedLabel string
+
+	// Find selected label from options
+	if selectedID != "" && originalRequest != nil {
+		for _, opt := range originalRequest.Options {
+			if opt.ID == selectedID {
+				selectedLabel = opt.TargetLabel
+				break
+			}
+		}
+	}
+
+	// Try free text search if no option selected
+	if selectedLabel == "" && freeText != "" {
+		// Try to resolve the free text to a label using semantic mapping
+		if label, ok := db.ResolveSemanticTerm(freeText); ok {
+			selectedLabel = label
+		} else {
+			// Check if it's a direct label name
+			listableLabels := db.GetListableLabels()
+			for _, l := range listableLabels {
+				if strings.EqualFold(l, freeText) || strings.EqualFold(db.LabelDisplayNames[l], freeText) {
+					selectedLabel = l
+					break
+				}
+			}
+		}
+	}
+
+	if selectedLabel == "" {
+		// Still no label - show clarification again
+		o.emitDebug(DebugEvent{
+			Type:    DebugEventStep,
+			Message: "Label listing: could not resolve selection, showing clarification again",
+		})
+
+		queryAnalyzer := o.clarificationSvc.GetQueryAnalyzer()
+		analysis, err := queryAnalyzer.Analyze(ctx, pending.OriginalQuery)
+		if err != nil {
+			return o.fallbackToRegularRetrieval(ctx, pending.OriginalQuery)
+		}
+		return o.handleLabelListingClarification(ctx, pending.OriginalQuery, analysis)
+	}
+
+	// Proceed with label listing retrieval
+	o.emitDebug(DebugEvent{
+		Type:    DebugEventStep,
+		Message: fmt.Sprintf("Label listing resolved: %s", selectedLabel),
+		Data:    map[string]any{"selected_label": selectedLabel},
+	})
+
+	docs, err := o.graphRAGRetriever.RetrieveWithLabelListingDirect(
+		ctx,
+		[]string{selectedLabel},
+		50,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("label listing retrieval failed: %w", err)
+	}
+
+	return &ClarificationDecision{
+		NeedsClarification: false,
+		Documents:          docs,
+	}, nil
+}
+
+// =============================================================================
+// Conditional Query Methods (Exploration-First Approach)
+// =============================================================================
+
+// handleConditionalQuery handles conditional queries using exploration-first approach
+// This is for queries like "Honda가 생산한 경쟁차 List" where:
+// - anchor = Honda (Manufacturer)
+// - condition = produces
+// - target_labels = [CompetitorVehicle] (from label listing detection)
+func (o *ClarificationOrchestrator) handleConditionalQuery(
+	ctx context.Context,
+	query string,
+	analysis *tools.QueryAnalysisOutput,
+) (*ClarificationDecision, error) {
+	o.emitDebug(DebugEvent{
+		Type:    DebugEventStep,
+		Message: "Executing conditional query with exploration-first approach",
+		Data: map[string]any{
+			"anchor_keywords": analysis.ConditionalAnchor.Keywords,
+			"condition_type":  analysis.ConditionalAnchor.ConditionType,
+			"target_labels":   analysis.Target.ExpectedLabels,
+			"filters":         analysis.ConditionalFilters,
+		},
+	})
+
+	// Use ConditionalRetriever with target labels from compound query detection
+	docs, err := o.graphRAGRetriever.RetrieveWithConditionAndTargets(
+		ctx,
+		query,
+		analysis.ConditionalAnchor,
+		analysis.ConditionalFilters,
+		analysis.Target.ExpectedLabels,
+		50,
+	)
+	if err != nil {
+		o.emitDebug(DebugEvent{
+			Type:    DebugEventStep,
+			Message: fmt.Sprintf("Conditional retrieval failed: %v, falling back to regular retrieval", err),
+		})
+		return o.fallbackToRegularRetrieval(ctx, query)
+	}
+
+	o.emitDebug(DebugEvent{
+		Type:    DebugEventStep,
+		Message: fmt.Sprintf("Conditional query successful: %d documents returned", len(docs)),
+	})
+
+	return &ClarificationDecision{
+		NeedsClarification: false,
+		Documents:          docs,
+		Analysis:           analysis,
+	}, nil
 }

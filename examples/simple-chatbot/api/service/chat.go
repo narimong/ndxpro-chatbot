@@ -68,15 +68,37 @@ Return ONLY the queries, one per line. No numbering, no explanation.
 User query: %s`
 )
 
+// clarificationNeededError is returned when additional clarification is needed
+type clarificationNeededError struct {
+	Request *ClarificationRequest
+	Phase   apimodel.ClarificationPhase
+}
+
+func (e *clarificationNeededError) Error() string {
+	if e.Request != nil {
+		return fmt.Sprintf("clarification needed: %s", e.Request.Reason)
+	}
+	return "clarification needed"
+}
+
+// IsClarificationNeeded checks if an error is a clarification needed error
+func IsClarificationNeeded(err error) (*ClarificationRequest, bool) {
+	if cne, ok := err.(*clarificationNeededError); ok {
+		return cne.Request, true
+	}
+	return nil, false
+}
+
 // ChatService handles chat operations with optional debug mode
 type ChatService struct {
-	chain        compose.Runnable[map[string]any, *schema.Message]
-	chatModel    model.ChatModel
-	retriever    retriever.Retriever
-	planner      *PlannerService
-	sessionStore *SessionStore
-	neo4jClient  *db.Neo4jClient
-	debugEnabled bool
+	chain             compose.Runnable[map[string]any, *schema.Message]
+	chatModel         model.ChatModel
+	retriever         retriever.Retriever
+	planner           *PlannerService
+	sessionStore      *SessionStore
+	neo4jClient       *db.Neo4jClient
+	debugEnabled      bool
+	comparisonService *ComparisonGraphService // Comparison query service
 }
 
 // NewChatService creates a new chat service
@@ -146,34 +168,34 @@ func NewChatService(ctx context.Context, cfg *config.Config, sessionStore *Sessi
 		log.Println("Using MockRetriever (Graph RAG disabled)")
 	}
 
+	// Initialize comparison service if GraphRAG is available
+	var comparisonService *ComparisonGraphService
+	if graphRAG, ok := activeRetriever.(*GraphRAGRetriever); ok && graphRAG != nil {
+		comparisonService = NewComparisonGraphService(&ComparisonGraphConfig{
+			GraphRAGRetriever: graphRAG,
+			ChatModel:         chatModel,
+			Neo4jClient:       neo4jClient,
+		})
+		log.Println("ComparisonGraphService initialized successfully")
+	}
+
 	return &ChatService{
-		chain:        chain,
-		chatModel:    chatModel,
-		retriever:    activeRetriever,
-		planner:      planner,
-		sessionStore: sessionStore,
-		neo4jClient:  neo4jClient,
-		debugEnabled: true,
+		chain:             chain,
+		chatModel:         chatModel,
+		retriever:         activeRetriever,
+		planner:           planner,
+		sessionStore:      sessionStore,
+		neo4jClient:       neo4jClient,
+		debugEnabled:      true,
+		comparisonService: comparisonService,
 	}, nil
 }
 
-// ChatStream handles non-debug streaming chat
+// ChatStream handles non-debug streaming chat (uses RAG without debug events)
 func (c *ChatService) ChatStream(ctx context.Context, sessionID, input string) (*schema.StreamReader[*schema.Message], error) {
-	session, err := c.sessionStore.Get(sessionID)
-	if err != nil {
-		return nil, err
-	}
-
-	systemPrompt := session.SystemPrompt
-	if systemPrompt == "" {
-		systemPrompt = defaultSystemPrompt
-	}
-
-	return c.chain.Stream(ctx, map[string]any{
-		"system_prompt": systemPrompt,
-		"history":       session.History,
-		"input":         input,
-	})
+	// Use the same RAG logic as debug mode, but without emitting debug events
+	noopEmitter := func(event string, data interface{}) {}
+	return c.ChatStreamWithDebug(ctx, sessionID, input, noopEmitter)
 }
 
 // ChatStreamWithDebug handles streaming chat with debug events
@@ -189,6 +211,72 @@ func (c *ChatService) ChatStreamWithDebug(
 
 	// Set emitter for planner
 	c.planner.SetEmitter(emitter)
+
+	// Step 0a: Check for comparison query FIRST (before regular clarification)
+	if c.comparisonService != nil {
+		c.comparisonService.SetDebugEmitter(emitter)
+
+		// Get pending comparison clarification if any
+		comparisonPending := c.sessionStore.GetPendingComparisonClarification(sessionID)
+
+		emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
+			StepID:    "comparison_check",
+			StepName:  "ComparisonQueryDetection",
+			Component: "comparison",
+			Status:    apimodel.StatusStarted,
+			Input:     map[string]string{"query": truncateString(input, 100)},
+			Timestamp: time.Now().UnixMilli(),
+		})
+
+		result, err := c.comparisonService.ProcessComparisonQuery(ctx, input, comparisonPending)
+		if err == nil && result != nil && result.IsComparison {
+			emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
+				StepID:    "comparison_check",
+				StepName:  "ComparisonQueryDetection",
+				Component: "comparison",
+				Status:    apimodel.StatusCompleted,
+				Output: map[string]interface{}{
+					"is_comparison":        result.IsComparison,
+					"needs_clarification":  result.NeedsClarification,
+					"entity_count":         len(result.ResolvedEntities),
+				},
+				Timestamp: time.Now().UnixMilli(),
+			})
+
+			if result.NeedsClarification {
+				// Store pending comparison clarification
+				c.sessionStore.SetPendingComparisonClarification(sessionID, result.PendingState)
+
+				// Emit clarification request (converted to standard format)
+				clarificationReq := c.convertComparisonClarification(result.ClarificationRequest)
+				log.Printf("[DEBUG] Emitting comparison clarification:request with Entity=%s, Options=%d",
+					result.ClarificationRequest.Entity,
+					len(result.ClarificationRequest.Options))
+				emitter(apimodel.EventClarificationReq, clarificationReq)
+
+				return nil, fmt.Errorf("comparison_clarification_required")
+			}
+
+			// Clear any pending comparison clarification
+			c.sessionStore.ClearPendingComparisonClarification(sessionID)
+
+			// Comparison query processed successfully - stream response with comparison context
+			return c.streamComparisonResponse(ctx, session, input, result)
+		}
+
+		// Not a comparison query - continue with regular flow
+		emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
+			StepID:    "comparison_check",
+			StepName:  "ComparisonQueryDetection",
+			Component: "comparison",
+			Status:    apimodel.StatusCompleted,
+			Output: map[string]interface{}{
+				"is_comparison": false,
+				"reason":        "not_a_comparison_query",
+			},
+			Timestamp: time.Now().UnixMilli(),
+		})
+	}
 
 	// Check for pending clarification first
 	pending, _ := c.sessionStore.GetPendingClarification(sessionID)
@@ -710,10 +798,31 @@ func (c *ChatService) processClarificationResponseInternal(
 		})
 	}
 
-	// If still needs clarification (Phase 2), return error for now
-	// In a more complete implementation, we would emit a new clarification request
-	if decision.NeedsClarification {
-		return nil, fmt.Errorf("additional clarification needed: %s", decision.ClarificationRequest.Reason)
+	// If still needs clarification (Phase 2), update pending and return clarification request
+	if decision.NeedsClarification && decision.ClarificationRequest != nil {
+		// Update pending clarification with new phase info
+		newPending := &apimodel.PendingClarification{
+			RequestID:      decision.ClarificationRequest.RequestID,
+			OriginalQuery:  pending.OriginalQuery,
+			Phase:          decision.Phase,
+			SourceNodeUUID: decision.SourceNodeUUID,
+			SourceNodeName: decision.SourceNodeName,
+			CreatedAt:      time.Now(),
+		}
+		if err := c.sessionStore.SetPendingClarification(sessionID, newPending); err != nil {
+			return nil, fmt.Errorf("failed to update pending clarification: %w", err)
+		}
+
+		// Emit clarification event for frontend
+		if emitter != nil {
+			emitter(apimodel.EventClarificationReq, decision.ClarificationRequest)
+		}
+
+		// Return a special error that the handler can recognize as needing clarification
+		return nil, &clarificationNeededError{
+			Request: decision.ClarificationRequest,
+			Phase:   decision.Phase,
+		}
 	}
 
 	// Build context from retrieved documents
@@ -745,4 +854,196 @@ func (c *ChatService) GetClarificationOrchestrator(emitter DebugEmitter) *Clarif
 		Neo4jClient:          c.neo4jClient,
 		DebugEmitter:         emitter,
 	})
+}
+
+// convertComparisonClarification converts a ComparisonClarificationRequest to a standard ClarificationRequest
+// for use with the existing frontend clarification handling.
+func (c *ChatService) convertComparisonClarification(req *ComparisonClarificationRequest) *ClarificationRequest {
+	if req == nil {
+		return nil
+	}
+
+	// Convert comparison options to standard ClarificationOpt
+	options := make([]ClarificationOpt, 0, len(req.Options))
+	for _, opt := range req.Options {
+		options = append(options, ClarificationOpt{
+			ID:          opt.UUID,
+			Label:       opt.Name,
+			Description: opt.Details,
+			TargetLabel: "Vehicle", // Comparison entities are typically vehicles
+		})
+	}
+
+	return &ClarificationRequest{
+		RequestID:     fmt.Sprintf("comparison_%s_%s", req.Phase, req.Entity),
+		OriginalQuery: "", // Will be set from pending state
+		Reason:        fmt.Sprintf("%s: %s", req.Reason, req.Message),
+		Options:       options,
+		AllowFreeText: false, // Comparison clarification requires selection
+	}
+}
+
+// streamComparisonResponse streams a response for a completed comparison query.
+// It uses the comparison analysis data to build context and generate a natural language response.
+func (c *ChatService) streamComparisonResponse(
+	ctx context.Context,
+	session *apimodel.Session,
+	input string,
+	result *ComparisonClarificationResult,
+) (*schema.StreamReader[*schema.Message], error) {
+	// Execute comparison analysis using the resolved entities
+	if c.comparisonService == nil {
+		return nil, fmt.Errorf("comparison service not available")
+	}
+
+	// Execute the full comparison with resolved entities
+	comparisonState, err := c.comparisonService.ExecuteWithResolvedEntities(
+		ctx,
+		result.ResolvedEntities,
+		result.ComparisonQuery,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("comparison execution failed: %w", err)
+	}
+
+	// Build comparison context from the analysis data
+	comparisonContext := c.comparisonService.BuildComparisonContext(comparisonState)
+
+	// Build system prompt with comparison context
+	systemPrompt := c.buildComparisonSystemPrompt(session.SystemPrompt, comparisonContext)
+
+	// Stream response
+	return c.chain.Stream(ctx, map[string]any{
+		"system_prompt": systemPrompt,
+		"history":       session.History,
+		"input":         input,
+	})
+}
+
+// buildComparisonSystemPrompt builds a system prompt specifically for comparison queries.
+func (c *ChatService) buildComparisonSystemPrompt(basePrompt, comparisonContext string) string {
+	if basePrompt == "" {
+		basePrompt = defaultSystemPrompt
+	}
+
+	comparisonSystemPrompt := `You are a helpful assistant specialized in comparative analysis.
+You have been provided with detailed comparison data between multiple entities.
+
+IMPORTANT FORMATTING GUIDELINES for comparison responses:
+1. Start with a brief summary of what is being compared
+2. Use markdown tables to show side-by-side comparisons
+3. Highlight significant differences with clear indicators:
+   - ✓ for advantages (subject outperforms reference)
+   - ✗ for disadvantages (subject underperforms reference)
+   - ★ for exceptional scores
+4. For gap analysis:
+   - List items ordered by priority (high → medium → low)
+   - Include specific improvement recommendations
+   - Show numerical gaps clearly (e.g., "4점 차이")
+5. End with a concise summary of key findings
+
+Example format for gap analysis:
+| 항목 | 기준 | 대상 | 차이 | 우선순위 |
+|------|------|------|------|----------|
+| 가속 | 42   | 38   | -4   | 높음     |
+| 제동 | 43   | 45   | +2   | -        |
+
+**보완 필요 항목:**
+1. 🔴 가속 성능 (우선순위: 높음)
+   - 현재: 38점 / 기준: 42점
+   - 개선 목표: 4점 향상 필요
+
+%s
+
+Comparison Analysis Data:
+%s`
+
+	return fmt.Sprintf(comparisonSystemPrompt, basePrompt, comparisonContext)
+}
+
+// ProcessComparisonClarificationResponse handles user's response to a comparison clarification request.
+// It continues the entity resolution process and returns either another clarification request or the final response.
+func (c *ChatService) ProcessComparisonClarificationResponse(
+	ctx context.Context,
+	sessionID string,
+	selectedIndex int,
+	selectedUUID string,
+	selectedName string,
+	emitter DebugEmitter,
+) (*schema.StreamReader[*schema.Message], error) {
+	session, err := c.sessionStore.Get(sessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get pending comparison clarification
+	pending := c.sessionStore.GetPendingComparisonClarification(sessionID)
+	if pending == nil {
+		return nil, fmt.Errorf("no pending comparison clarification for session")
+	}
+
+	if c.comparisonService == nil {
+		return nil, fmt.Errorf("comparison service not available")
+	}
+
+	// Get comparison clarification orchestrator
+	orchestrator := c.comparisonService.GetClarificationOrchestrator()
+	if orchestrator == nil {
+		return nil, fmt.Errorf("comparison clarification orchestrator not available")
+	}
+
+	if emitter != nil {
+		emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
+			StepID:    "comparison_clarification_response",
+			StepName:  "ComparisonClarificationResponse",
+			Component: "comparison",
+			Status:    apimodel.StatusStarted,
+			Input: map[string]interface{}{
+				"selected_index": selectedIndex,
+				"selected_uuid":  selectedUUID,
+				"selected_name":  selectedName,
+			},
+			Timestamp: time.Now().UnixMilli(),
+		})
+	}
+
+	// Process the clarification response
+	result, err := orchestrator.ProcessClarificationResponse(ctx, pending, selectedIndex, selectedUUID, selectedName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to process comparison clarification: %w", err)
+	}
+
+	if emitter != nil {
+		emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
+			StepID:    "comparison_clarification_response",
+			StepName:  "ComparisonClarificationResponse",
+			Component: "comparison",
+			Status:    apimodel.StatusCompleted,
+			Output: map[string]interface{}{
+				"needs_clarification": result.NeedsClarification,
+				"resolved_count":      len(result.ResolvedEntities),
+			},
+			Timestamp: time.Now().UnixMilli(),
+		})
+	}
+
+	// If more clarification is needed for other entities
+	if result.NeedsClarification {
+		// Update pending state
+		c.sessionStore.SetPendingComparisonClarification(sessionID, result.PendingState)
+
+		// Emit clarification request
+		clarificationReq := c.convertComparisonClarification(result.ClarificationRequest)
+		if emitter != nil {
+			emitter(apimodel.EventClarificationReq, clarificationReq)
+		}
+
+		return nil, fmt.Errorf("comparison_clarification_required")
+	}
+
+	// All entities resolved - clear pending and execute comparison
+	c.sessionStore.ClearPendingComparisonClarification(sessionID)
+
+	// Stream the comparison response
+	return c.streamComparisonResponse(ctx, session, pending.OriginalQuery, result)
 }

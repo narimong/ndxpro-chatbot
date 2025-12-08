@@ -54,6 +54,7 @@ type GraphRAGRetriever struct {
 	shortestPathTool     *tools.Neo4jShortestPathTool
 	queryAnalyzer        *tools.QueryAnalyzerTool
 	clarificationService *ClarificationService
+	conditionalRetriever *ConditionalRetriever // Exploration-first conditional query handler
 	debugEmitter         DebugEmitter
 	defaultTopK          int
 	maxGraphDepth        int
@@ -104,15 +105,26 @@ func NewGraphRAGRetriever(config *GraphRAGConfig) (*GraphRAGRetriever, error) {
 		queryAnalyzer = clarificationSvc.GetQueryAnalyzer()
 	}
 
+	// Initialize full-text tool (shared by multiple components)
+	fullTextTool := tools.NewNeo4jFullTextSearchTool(config.Neo4jClient)
+
+	// Initialize conditional retriever for exploration-first queries
+	conditionalRetriever := NewConditionalRetriever(&ConditionalRetrieverConfig{
+		Neo4jClient:  config.Neo4jClient,
+		FullTextTool: fullTextTool,
+		DebugEmitter: config.DebugEmitter,
+	})
+
 	return &GraphRAGRetriever{
 		neo4jClient:          config.Neo4jClient,
 		chatModel:            config.ChatModel,
-		fullTextTool:         tools.NewNeo4jFullTextSearchTool(config.Neo4jClient),
+		fullTextTool:         fullTextTool,
 		rerankerTool:         tools.NewLLMRerankerTool(config.ChatModel),
 		graphTool:            tools.NewNeo4jGraphTraversalTool(config.Neo4jClient),
 		shortestPathTool:     tools.NewNeo4jShortestPathTool(config.Neo4jClient),
 		queryAnalyzer:        queryAnalyzer,
 		clarificationService: clarificationSvc,
+		conditionalRetriever: conditionalRetriever,
 		debugEmitter:         config.DebugEmitter,
 		defaultTopK:          config.DefaultTopK,
 		maxGraphDepth:        config.MaxGraphDepth,
@@ -215,12 +227,45 @@ func (r *GraphRAGRetriever) retrieveWithShortestPath(ctx context.Context, query 
 		return r.retrieveLegacy(ctx, query, topK)
 	}
 
+	// NEW: Check for label listing query (e.g., "모든 경쟁차 알려줘")
+	// This must be checked BEFORE other paths since label listing doesn't need keyword search
+	if analysis.IsLabelListing {
+		r.emitDebug(DebugEvent{
+			Type:    DebugEventStep,
+			Message: fmt.Sprintf("Label listing query detected: labels=%v, limit=%d",
+				analysis.ListingLabels, analysis.ListingLimit),
+			Data: map[string]any{
+				"listing_labels":  analysis.ListingLabels,
+				"listing_limit":   analysis.ListingLimit,
+				"resolved_labels": analysis.ResolvedLabels,
+			},
+		})
+		return r.retrieveWithLabelListing(ctx, query, analysis, topK)
+	}
+
+	// NEW: Check for conditional query (e.g., "Honda가 생산하는 모든 차량")
+	// This uses exploration-first approach: find anchor -> explore relations -> traverse
+	if analysis.IsConditionalQuery && analysis.ConditionalAnchor != nil {
+		r.emitDebug(DebugEvent{
+			Type:    DebugEventStep,
+			Message: fmt.Sprintf("Conditional query detected: anchor=%v, condition=%s",
+				analysis.ConditionalAnchor.Keywords, analysis.ConditionalAnchor.ConditionType),
+			Data: map[string]any{
+				"conditional_anchor":  analysis.ConditionalAnchor,
+				"conditional_filters": analysis.ConditionalFilters,
+			},
+		})
+		return r.conditionalRetriever.RetrieveWithCondition(
+			ctx, query, analysis.ConditionalAnchor, analysis.ConditionalFilters, topK)
+	}
+
 	// Check if this is a hierarchical query (e.g., "하위 점수 모두")
 	isHierarchical := r.DetectHierarchicalQuery(query)
 
 	r.emitDebug(DebugEvent{
 		Type:    DebugEventPlan,
-		Message: fmt.Sprintf("Analysis: confidence=%.2f, targets=%v, hierarchical=%v", analysis.Confidence, analysis.Target.ExpectedLabels, isHierarchical),
+		Message: fmt.Sprintf("Analysis: confidence=%.2f, targets=%v, hierarchical=%v, strategy=%s",
+			analysis.Confidence, analysis.Target.ExpectedLabels, isHierarchical, analysis.SearchStrategy),
 		Data:    map[string]any{"analysis": analysis, "is_hierarchical": isHierarchical},
 	})
 
@@ -234,7 +279,7 @@ func (r *GraphRAGRetriever) retrieveWithShortestPath(ctx context.Context, query 
 		// Continue with best effort - use keywords for search
 	}
 
-	// Stage 2: Full-Text Search using extracted keywords
+	// Stage 2: Search based on strategy from analysis
 	keywords := analysis.StartEntity.Keywords
 	if len(keywords) == 0 {
 		// Use original query
@@ -242,49 +287,78 @@ func (r *GraphRAGRetriever) retrieveWithShortestPath(ctx context.Context, query 
 	}
 
 	searchQuery := strings.Join(keywords, " ")
+
+	// Determine search strategy
+	searchStrategy := analysis.SearchStrategy
+	if searchStrategy == "" {
+		searchStrategy = "generic" // Default to generic search
+	}
+
 	r.emitDebug(DebugEvent{
 		Type:    DebugEventQuery,
-		Message: fmt.Sprintf("Stage 2: Full-Text Search for '%s'", searchQuery),
-		Data:    map[string]any{"keywords": keywords},
+		Message: fmt.Sprintf("Stage 2: Search with strategy '%s' for '%s'", searchStrategy, searchQuery),
+		Data:    map[string]any{"keywords": keywords, "strategy": searchStrategy},
 	})
 
-	searchInput := tools.FullTextSearchInput{
-		Query: searchQuery,
-		TopK:  10,
-	}
-	searchInputJSON, _ := json.Marshal(searchInput)
+	// Execute search based on strategy
+	var candidates []tools.NodeCandidate
+	var searchErr error
 
-	searchResultJSON, err := r.fullTextTool.InvokableRun(ctx, string(searchInputJSON))
-	if err != nil {
-		return nil, fmt.Errorf("full-text search failed: %w", err)
+	switch searchStrategy {
+	case "exact", "fuzzy", "generic":
+		// Use generic search with fallback (handles exact, wildcard, fuzzy)
+		candidates, searchErr = r.fullTextTool.SearchWithFallback(ctx, searchQuery, "", topK*2)
+	case "label_filtered":
+		// Use label-filtered search if expected labels are available
+		labelHint := ""
+		if len(analysis.StartEntity.ExpectedLabels) > 0 {
+			labelHint = analysis.StartEntity.ExpectedLabels[0]
+		}
+		candidates, searchErr = r.fullTextTool.SearchWithFallback(ctx, searchQuery, labelHint, topK*2)
+	default:
+		// Default fallback to generic search
+		candidates, searchErr = r.fullTextTool.SearchWithFallback(ctx, searchQuery, "", topK*2)
 	}
 
-	var searchResult tools.FullTextSearchResult
-	if err := json.Unmarshal([]byte(searchResultJSON), &searchResult); err != nil {
-		return nil, fmt.Errorf("failed to parse search result: %w", err)
+	if searchErr != nil {
+		return nil, fmt.Errorf("search failed: %w", searchErr)
 	}
 
 	r.emitDebug(DebugEvent{
 		Type:    DebugEventRetrieval,
-		Message: fmt.Sprintf("Found %d candidate nodes", len(searchResult.Candidates)),
-		Data:    map[string]any{"candidates": searchResult.Candidates},
+		Message: fmt.Sprintf("Found %d candidate nodes", len(candidates)),
+		Data:    map[string]any{"candidates": candidates},
 	})
 
-	if len(searchResult.Candidates) == 0 {
+	if len(candidates) == 0 {
+		// For exploration queries with no results, return informative message
+		if analysis.QueryType == "exploration" {
+			return []*schema.Document{{
+				ID:      "no_results",
+				Content: fmt.Sprintf("검색어 '%s'에 해당하는 데이터를 찾지 못했습니다.", searchQuery),
+				MetaData: map[string]any{
+					"source": "graph_rag_no_results",
+				},
+			}}, nil
+		}
 		return []*schema.Document{}, nil
 	}
 
 	// Enrich candidates with variant info (engine, trim, year) for disambiguation
 	// This is essential when multiple variants of the same vehicle exist (e.g., Tucson 1.6T vs 2.0D)
-	searchResult.Candidates = r.enrichCandidatesWithVariant(ctx, searchResult.Candidates)
+	candidates = r.enrichCandidatesWithVariant(ctx, candidates)
 
-	// Stage 3: Shortest Path Navigation to target labels
+	// For exploration queries without target labels, return node info with neighbors
 	targetLabels := analysis.Target.ExpectedLabels
-	if len(targetLabels) == 0 {
-		// Fallback to graph traversal
-		return r.retrieveWithTraversal(ctx, searchResult.Candidates, topK)
+	if len(targetLabels) == 0 || analysis.QueryType == "exploration" {
+		r.emitDebug(DebugEvent{
+			Type:    DebugEventStep,
+			Message: "No target labels - using exploration mode",
+		})
+		return r.retrieveWithExploration(ctx, candidates, topK)
 	}
 
+	// Stage 3: Shortest Path Navigation to target labels
 	r.emitDebug(DebugEvent{
 		Type:    DebugEventStep,
 		Message: fmt.Sprintf("Stage 3: Shortest Path to %v (hierarchical=%v)", targetLabels, isHierarchical),
@@ -295,8 +369,8 @@ func (r *GraphRAGRetriever) retrieveWithShortestPath(ctx context.Context, query 
 	processedPaths := make(map[string]bool) // Dedupe paths
 
 	// For each top candidate, find paths to target labels
-	maxCandidates := min(3, len(searchResult.Candidates))
-	for _, candidate := range searchResult.Candidates[:maxCandidates] {
+	maxCandidates := min(3, len(candidates))
+	for _, candidate := range candidates[:maxCandidates] {
 		// If hierarchical query, use hierarchical retrieval
 		if isHierarchical {
 			r.emitDebug(DebugEvent{
@@ -362,7 +436,7 @@ func (r *GraphRAGRetriever) retrieveWithShortestPath(ctx context.Context, query 
 			Type:    DebugEventStep,
 			Message: "No paths found, falling back to graph traversal",
 		})
-		return r.retrieveWithTraversal(ctx, searchResult.Candidates, topK)
+		return r.retrieveWithTraversal(ctx, candidates, topK)
 	}
 
 	return documents, nil
@@ -402,6 +476,83 @@ func (r *GraphRAGRetriever) pathToDocument(source tools.NodeCandidate, path db.P
 			"target_labels": path.EndNodeLabels,
 			"target_props":  path.EndProperties,
 			"source":        "graph_rag_shortest_path",
+		},
+	}
+}
+
+// retrieveWithExploration retrieves documents for exploration queries
+// Used when no specific target labels are provided - returns node info with neighbor context
+func (r *GraphRAGRetriever) retrieveWithExploration(ctx context.Context, candidates []tools.NodeCandidate, topK int) ([]*schema.Document, error) {
+	r.emitDebug(DebugEvent{
+		Type:    DebugEventStep,
+		Message: fmt.Sprintf("Exploration mode: processing %d candidates", len(candidates)),
+	})
+
+	documents := make([]*schema.Document, 0)
+	maxCandidates := min(topK, len(candidates))
+
+	for _, candidate := range candidates[:maxCandidates] {
+		// Build document with node info and neighbor context
+		doc := r.candidateToExplorationDocument(candidate)
+		documents = append(documents, doc)
+	}
+
+	return documents, nil
+}
+
+// candidateToExplorationDocument creates a document for exploration queries
+// Includes node properties and neighbor relationships for comprehensive context
+func (r *GraphRAGRetriever) candidateToExplorationDocument(candidate tools.NodeCandidate) *schema.Document {
+	var content strings.Builder
+
+	// Header with node info
+	content.WriteString(fmt.Sprintf("# [%s] %s\n\n", strings.Join(candidate.Labels, ", "), candidate.Name))
+
+	// Properties section
+	if len(candidate.Properties) > 0 {
+		content.WriteString("## 속성 (Properties)\n")
+		for k, v := range candidate.Properties {
+			// Skip internal properties
+			if strings.HasPrefix(k, "_") || k == "uuid" || k == "embedding" {
+				continue
+			}
+			content.WriteString(fmt.Sprintf("- **%s**: %v\n", k, v))
+		}
+		content.WriteString("\n")
+	}
+
+	// Neighbor relationships section
+	if len(candidate.NeighborSummary) > 0 {
+		content.WriteString("## 연결된 노드 (Related Nodes)\n")
+		for _, neighbor := range candidate.NeighborSummary {
+			direction := "→"
+			if !neighbor.Outgoing {
+				direction = "←"
+			}
+			content.WriteString(fmt.Sprintf("- %s [%s] **%s** ([%s])\n",
+				direction,
+				neighbor.Relationship,
+				neighbor.Name,
+				strings.Join(neighbor.Labels, ", ")))
+		}
+		content.WriteString("\n")
+	}
+
+	// Variant info for vehicles
+	if candidate.VariantInfo != nil && !candidate.VariantInfo.IsEmpty() {
+		content.WriteString("## 변형 정보 (Variant Info)\n")
+		content.WriteString(fmt.Sprintf("- %s\n", candidate.VariantInfo.FormatDisplay()))
+	}
+
+	return &schema.Document{
+		ID:      candidate.UUID,
+		Content: content.String(),
+		MetaData: map[string]any{
+			"labels":     candidate.Labels,
+			"name":       candidate.Name,
+			"score":      candidate.Score,
+			"source":     "graph_rag_exploration",
+			"properties": candidate.Properties,
 		},
 	}
 }
@@ -1385,6 +1536,200 @@ func (r *GraphRAGRetriever) enrichCandidatesWithVariant(ctx context.Context, can
 	})
 
 	return candidates
+}
+
+// =============================================================================
+// Label Listing Methods (for "list all X" queries)
+// =============================================================================
+
+// retrieveWithLabelListing handles "list all nodes of label X" queries
+// This method is called when analysis.IsLabelListing is true
+func (r *GraphRAGRetriever) retrieveWithLabelListing(
+	ctx context.Context,
+	query string,
+	analysis *tools.QueryAnalysisOutput,
+	topK int,
+) ([]*schema.Document, error) {
+	// Determine limit
+	limit := analysis.ListingLimit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > topK*2 {
+		limit = topK * 2
+	}
+
+	// If no labels resolved, this needs clarification
+	// Return empty documents and let clarification orchestrator handle it
+	if len(analysis.ListingLabels) == 0 {
+		r.emitDebug(DebugEvent{
+			Type:    DebugEventClarification,
+			Message: "Label listing query but no labels resolved - needs clarification",
+			Data:    map[string]any{"query": query},
+		})
+
+		// Return informative message indicating clarification needed
+		return []*schema.Document{{
+			ID:      "label_listing_clarification_needed",
+			Content: "검색하려는 항목의 유형을 선택해주세요.",
+			MetaData: map[string]any{
+				"source":              "label_listing",
+				"needs_clarification": true,
+				"query":               query,
+			},
+		}}, nil
+	}
+
+	documents := make([]*schema.Document, 0)
+
+	// Query each label
+	for _, label := range analysis.ListingLabels {
+		r.emitDebug(DebugEvent{
+			Type:    DebugEventQuery,
+			Message: fmt.Sprintf("Listing nodes with label '%s' (limit=%d)", label, limit),
+			Data:    map[string]any{"label": label, "limit": limit},
+		})
+
+		results, total, err := r.neo4jClient.ListNodesByLabel(ctx, label, limit, "name")
+		if err != nil {
+			r.emitDebug(DebugEvent{
+				Type:    DebugEventStep,
+				Message: fmt.Sprintf("Failed to list label '%s': %v", label, err),
+			})
+			continue
+		}
+
+		r.emitDebug(DebugEvent{
+			Type:    DebugEventRetrieval,
+			Message: fmt.Sprintf("Found %d nodes for label '%s' (total: %d)", len(results), label, total),
+			Data:    map[string]any{"label": label, "count": len(results), "total": total},
+		})
+
+		// Format as document
+		doc := r.formatLabelListDocument(results, label, total, limit)
+		documents = append(documents, doc)
+	}
+
+	if len(documents) == 0 {
+		return []*schema.Document{{
+			ID:      "no_results",
+			Content: fmt.Sprintf("해당 라벨에 대한 데이터가 없습니다."),
+			MetaData: map[string]any{
+				"source": "label_listing_empty",
+			},
+		}}, nil
+	}
+
+	return documents, nil
+}
+
+// formatLabelListDocument formats label listing results as a markdown document
+func (r *GraphRAGRetriever) formatLabelListDocument(
+	results []map[string]any,
+	label string,
+	total int,
+	limit int,
+) *schema.Document {
+	displayName := r.getLabelDisplayName(label)
+
+	var content strings.Builder
+
+	// Header
+	content.WriteString(fmt.Sprintf("# %s 목록\n\n", displayName))
+	content.WriteString(fmt.Sprintf("**총 %d개**의 %s이(가) 등록되어 있습니다.\n\n", total, displayName))
+
+	if len(results) == 0 {
+		content.WriteString("_데이터가 없습니다._\n")
+	} else {
+		// Table header
+		content.WriteString("| # | 이름 | 상세 정보 |\n")
+		content.WriteString("|---|------|----------|\n")
+
+		// Table rows
+		for i, node := range results {
+			name := ""
+			if n, ok := node["name"].(string); ok {
+				name = n
+			}
+
+			// Extract variant info for display
+			details := ""
+			if props, ok := node["properties"].(map[string]any); ok {
+				variantInfo := db.ExtractVariantInfo(props)
+				if variantInfo != nil && !variantInfo.IsEmpty() {
+					details = variantInfo.FormatDisplay()
+				}
+			}
+
+			content.WriteString(fmt.Sprintf("| %d | %s | %s |\n", i+1, name, details))
+		}
+
+		// Show "more" indicator
+		if total > len(results) {
+			content.WriteString(fmt.Sprintf("\n_... 외 %d개 더 있음_\n", total-len(results)))
+		}
+	}
+
+	return &schema.Document{
+		ID:      fmt.Sprintf("label_list_%s", label),
+		Content: content.String(),
+		MetaData: map[string]any{
+			"source":      "label_listing",
+			"label":       label,
+			"total_count": total,
+			"shown_count": len(results),
+			"has_more":    total > len(results),
+		},
+	}
+}
+
+// RetrieveWithLabelListingDirect provides direct access to label listing for use after clarification
+// This is called by clarification orchestrator after user selects a label
+func (r *GraphRAGRetriever) RetrieveWithLabelListingDirect(
+	ctx context.Context,
+	labels []string,
+	limit int,
+) ([]*schema.Document, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+
+	analysis := &tools.QueryAnalysisOutput{
+		IsLabelListing: true,
+		ListingLabels:  labels,
+		ListingLimit:   limit,
+	}
+
+	return r.retrieveWithLabelListing(ctx, "", analysis, limit)
+}
+
+// RetrieveWithConditionAndTargets provides access to conditional retrieval with explicit target labels
+// This is called by clarification orchestrator for compound queries like "Honda가 생산한 경쟁차 List"
+func (r *GraphRAGRetriever) RetrieveWithConditionAndTargets(
+	ctx context.Context,
+	query string,
+	anchor *tools.ConditionalAnchor,
+	filters []tools.ConditionalFilter,
+	targetLabels []string,
+	topK int,
+) ([]*schema.Document, error) {
+	if r.conditionalRetriever == nil {
+		return nil, fmt.Errorf("conditional retriever not configured")
+	}
+
+	r.emitDebug(DebugEvent{
+		Type:    DebugEventStep,
+		Message: "RetrieveWithConditionAndTargets called",
+		Data: map[string]any{
+			"anchor":        anchor.Keywords,
+			"condition":     anchor.ConditionType,
+			"target_labels": targetLabels,
+			"filters":       filters,
+		},
+	})
+
+	return r.conditionalRetriever.RetrieveWithConditionAndTargetLabels(
+		ctx, query, anchor, filters, targetLabels, topK)
 }
 
 // Ensure GraphRAGRetriever implements the Retriever interface

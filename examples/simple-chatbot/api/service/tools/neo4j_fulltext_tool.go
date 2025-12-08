@@ -131,6 +131,115 @@ func (t *Neo4jFullTextSearchTool) InvokableRun(ctx context.Context, argumentsInJ
 	return string(result), nil
 }
 
+// SearchWithFallback performs a search with multiple fallback strategies
+// Strategy 1: Label-specific search (if label hint provided)
+// Strategy 2: Generic search across all indexed nodes
+// Strategy 3: Wildcard/Fuzzy search for partial matches
+func (t *Neo4jFullTextSearchTool) SearchWithFallback(ctx context.Context, query string, labelHint string, topK int) ([]NodeCandidate, error) {
+	if topK <= 0 {
+		topK = 20
+	}
+
+	// Strategy 1: Try label-specific search if hint provided
+	if labelHint != "" {
+		results, err := t.client.FullTextSearchWithLabelGroup(ctx, query, labelHint, topK)
+		if err == nil && len(results) > 0 {
+			return t.mapResultsToCandidates(results), nil
+		}
+	}
+
+	// Strategy 2: Try generic search with fallback (includes wildcard and fuzzy)
+	genericResults, err := t.client.GenericFullTextSearchWithFallback(ctx, query, topK)
+	if err == nil && len(genericResults) > 0 {
+		return t.mapGenericResultsToCandidates(genericResults), nil
+	}
+
+	return []NodeCandidate{}, nil
+}
+
+// SearchGeneric performs a label-agnostic search with relationship context
+func (t *Neo4jFullTextSearchTool) SearchGeneric(ctx context.Context, query string, topK int, includeContext bool) ([]NodeCandidate, error) {
+	if topK <= 0 {
+		topK = 20
+	}
+
+	results, err := t.client.GenericFullTextSearch(ctx, query, topK, includeContext)
+	if err != nil {
+		return nil, err
+	}
+
+	return t.mapGenericResultsToCandidates(results), nil
+}
+
+// mapResultsToCandidates converts map results to NodeCandidate slice
+func (t *Neo4jFullTextSearchTool) mapResultsToCandidates(results []map[string]any) []NodeCandidate {
+	candidates := make([]NodeCandidate, 0, len(results))
+	for _, r := range results {
+		candidate := NodeCandidate{
+			Properties: make(map[string]any),
+		}
+
+		if uuid, ok := r["uuid"].(string); ok {
+			candidate.UUID = uuid
+		}
+		if name, ok := r["name"].(string); ok {
+			candidate.Name = name
+		}
+		if labels, ok := r["labels"].([]any); ok {
+			for _, l := range labels {
+				if labelStr, ok := l.(string); ok {
+					candidate.Labels = append(candidate.Labels, labelStr)
+				}
+			}
+		}
+		if score, ok := r["score"].(float64); ok {
+			candidate.Score = score
+		}
+		if props, ok := r["properties"].(map[string]any); ok {
+			candidate.Properties = props
+			candidate.VariantInfo = db.ExtractVariantInfo(props)
+		}
+
+		candidates = append(candidates, candidate)
+	}
+	return candidates
+}
+
+// mapGenericResultsToCandidates converts GenericSearchResult to NodeCandidate slice
+func (t *Neo4jFullTextSearchTool) mapGenericResultsToCandidates(results []db.GenericSearchResult) []NodeCandidate {
+	candidates := make([]NodeCandidate, 0, len(results))
+	for _, r := range results {
+		candidate := NodeCandidate{
+			UUID:       r.UUID,
+			Name:       r.Name,
+			Labels:     r.Labels,
+			Properties: r.Properties,
+			Score:      r.Score,
+		}
+
+		// Extract variant info
+		candidate.VariantInfo = db.ExtractVariantInfo(r.Properties)
+
+		// Convert neighbor context to NeighborInfo
+		if len(r.Neighbors) > 0 {
+			candidate.NeighborSummary = make([]db.NeighborInfo, 0, len(r.Neighbors))
+			for _, n := range r.Neighbors {
+				neighbor := db.NeighborInfo{
+					Relationship: n.Relationship,
+					Outgoing:     n.Direction == "outgoing",
+					Name:         n.NeighborName,
+					UUID:         n.NeighborUUID,
+					Labels:       n.NeighborLabels,
+				}
+				candidate.NeighborSummary = append(candidate.NeighborSummary, neighbor)
+			}
+		}
+
+		candidates = append(candidates, candidate)
+	}
+	return candidates
+}
+
 // Ensure Neo4jFullTextSearchTool implements the required interfaces
 var (
 	_ tool.BaseTool      = (*Neo4jFullTextSearchTool)(nil)
