@@ -6,6 +6,13 @@ class ChatApp {
         this.isStreaming = false;
         this.currentBotMessage = null;
         this.debugMode = false;
+        this.vizMode = true;
+
+        // Viz data storage
+        this.vizNodes = [];
+        this.vizEdges = [];
+        this.vizQueries = [];
+        this.lastVizPayload = null;
 
         this.initElements();
         this.initEventListeners();
@@ -30,6 +37,16 @@ class ChatApp {
         this.debugPanel = document.getElementById('debugPanel');
         this.debugContent = document.getElementById('debugContent');
         this.clearDebugBtn = document.getElementById('clearDebugBtn');
+
+        // Viz mode elements
+        this.vizModeToggle = document.getElementById('vizMode');
+        this.vizModeLabel = document.getElementById('vizModeLabel');
+        this.vizPanel = document.getElementById('vizPanel');
+        this.vizEvents = document.getElementById('vizEvents');
+        this.vizNodeCount = document.getElementById('vizNodeCount');
+        this.vizEdgeCount = document.getElementById('vizEdgeCount');
+        this.vizQueryCount = document.getElementById('vizQueryCount');
+        this.clearVizBtn = document.getElementById('clearVizBtn');
     }
 
     initEventListeners() {
@@ -62,6 +79,23 @@ class ChatApp {
         this.clearDebugBtn.addEventListener('click', () => {
             this.clearDebugLog();
         });
+
+        // Viz mode toggle
+        this.vizModeToggle.addEventListener('change', () => {
+            this.vizMode = this.vizModeToggle.checked;
+            this.vizModeLabel.textContent = this.vizMode ? 'ON' : 'OFF';
+            this.vizModeLabel.classList.toggle('active', this.vizMode);
+            this.vizPanel.style.display = this.vizMode ? 'flex' : 'none';
+        });
+
+        // Clear viz log
+        this.clearVizBtn.addEventListener('click', () => {
+            this.clearVizLog();
+        });
+
+        // Initialize viz panel visibility
+        this.vizPanel.style.display = this.vizMode ? 'flex' : 'none';
+        this.vizModeLabel.classList.toggle('active', this.vizMode);
     }
 
     async handleConnect() {
@@ -113,6 +147,7 @@ class ChatApp {
 
         this.clearMessages();
         this.clearDebugLog();
+        this.clearVizLog();
 
         try {
             await this.createSession();
@@ -197,7 +232,179 @@ class ChatApp {
         this.socket.on('clarification:request', (data) => {
             this.handleClarificationRequest(data);
         });
+
+        // Viz event listeners (NEW)
+        this.socket.on('viz:node', (data) => {
+            console.log('[VIZ] Received viz:node:', data);
+            this.handleVizNode(data);
+        });
+
+        this.socket.on('viz:edge', (data) => {
+            console.log('[VIZ] Received viz:edge:', data);
+            this.handleVizEdge(data);
+        });
+
+        this.socket.on('viz:cypher', (data) => {
+            console.log('[VIZ] Received viz:cypher:', data);
+            this.handleVizCypher(data);
+        });
+
+        this.socket.on('viz:complete', (data) => {
+            console.log('[VIZ] Received viz:complete:', data);
+            this.handleVizComplete(data);
+        });
     }
+
+    // ============================================
+    // Viz Event Handlers (NEW)
+    // ============================================
+
+    handleVizNode(data) {
+        this.vizNodes.push(data);
+        this.updateVizStats();
+
+        if (this.vizMode) {
+            const labels = data.labels ? data.labels.join(', ') : 'N/A';
+            const score = data.score ? ` (score: ${data.score.toFixed(2)})` : '';
+            const source = data.source ? ` [${data.source}]` : '';
+
+            let detailsHtml = '';
+            if (data.uuid) {
+                detailsHtml += `<div class="detail-item">UUID: ${data.uuid.substring(0, 12)}...</div>`;
+            }
+            if (data.depth !== undefined) {
+                detailsHtml += `<div class="detail-item">Depth: ${data.depth}</div>`;
+            }
+
+            this.addVizEvent('node', `${data.name} [${labels}]${score}${source}`, detailsHtml);
+        }
+    }
+
+    handleVizEdge(data) {
+        this.vizEdges.push(data);
+        this.updateVizStats();
+
+        if (this.vizMode) {
+            const direction = data.direction || 'outgoing';
+            const fromShort = data.from_uuid ? data.from_uuid.substring(0, 8) : '?';
+            const toShort = data.to_uuid ? data.to_uuid.substring(0, 8) : '?';
+
+            let detailsHtml = `<div class="detail-item">${fromShort}... → ${toShort}...</div>`;
+
+            this.addVizEvent('edge', `${data.relationship} (${direction})`, detailsHtml);
+        }
+    }
+
+    handleVizCypher(data) {
+        this.vizQueries.push(data);
+        this.updateVizStats();
+
+        if (this.vizMode) {
+            const cypherPreview = data.cypher && data.cypher.length > 50
+                ? data.cypher.substring(0, 50) + '...'
+                : (data.cypher || 'N/A');
+            const duration = data.duration_ms ? `${data.duration_ms}ms` : 'N/A';
+            const resultCount = data.result_count !== undefined ? data.result_count : '?';
+
+            let detailsHtml = '';
+            if (data.source) {
+                detailsHtml += `<div class="detail-item">Source: ${data.source}</div>`;
+            }
+
+            this.addVizEvent('cypher', `${cypherPreview} (${resultCount} results, ${duration})`, detailsHtml);
+        }
+    }
+
+    handleVizComplete(data) {
+        this.lastVizPayload = data;
+
+        if (this.vizMode) {
+            const nodeCount = data.nodes ? data.nodes.length : 0;
+            const edgeCount = data.edges ? data.edges.length : 0;
+            const queryCount = data.cypher_queries ? data.cypher_queries.length : 0;
+
+            let detailsHtml = '';
+            if (data.hierarchy) {
+                detailsHtml += `<div class="detail-item">Hierarchy root: ${data.hierarchy.root_uuid?.substring(0, 8)}...</div>`;
+                if (data.hierarchy.tree) {
+                    detailsHtml += `<div class="detail-item">Tree size: ${data.hierarchy.tree.length}</div>`;
+                }
+            }
+            if (data.answer_node_ids && data.answer_node_ids.length > 0) {
+                detailsHtml += `<div class="detail-item">Answer nodes: ${data.answer_node_ids.length}</div>`;
+            }
+
+            this.addVizEvent('complete', `${nodeCount} nodes, ${edgeCount} edges, ${queryCount} queries`, detailsHtml);
+        }
+
+        console.log('Viz Complete Payload:', data);
+    }
+
+    addVizEvent(type, content, detailsHtml = '') {
+        // Remove placeholder if exists
+        const placeholder = this.vizEvents.querySelector('.viz-placeholder');
+        if (placeholder) {
+            placeholder.remove();
+        }
+
+        const timestamp = new Date().toLocaleTimeString('ko-KR', {
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: false
+        });
+
+        const entry = document.createElement('div');
+        entry.className = `viz-event ${type}`;
+
+        const typeLabel = {
+            'node': 'NODE',
+            'edge': 'EDGE',
+            'cypher': 'CYPHER',
+            'complete': 'COMPLETE'
+        }[type] || type.toUpperCase();
+
+        const emoji = {
+            'node': '🔵',
+            'edge': '🔗',
+            'cypher': '📜',
+            'complete': '✅'
+        }[type] || '📣';
+
+        entry.innerHTML = `
+            <span class="viz-timestamp">${timestamp}</span>
+            <span class="viz-type ${type}">${emoji} ${typeLabel}</span>
+            <span class="viz-content">${content}</span>
+            ${detailsHtml ? `<div class="viz-details">${detailsHtml}</div>` : ''}
+        `;
+
+        this.vizEvents.appendChild(entry);
+        this.vizEvents.scrollTop = this.vizEvents.scrollHeight;
+    }
+
+    updateVizStats() {
+        this.vizNodeCount.textContent = this.vizNodes.length;
+        this.vizEdgeCount.textContent = this.vizEdges.length;
+        this.vizQueryCount.textContent = this.vizQueries.length;
+    }
+
+    clearVizLog() {
+        this.vizNodes = [];
+        this.vizEdges = [];
+        this.vizQueries = [];
+        this.lastVizPayload = null;
+        this.updateVizStats();
+
+        this.vizEvents.innerHTML = `
+            <div class="viz-placeholder">
+                No visualization events yet. Send a message to start.
+            </div>
+        `;
+    }
+
+    // ============================================
+    // Existing handlers
+    // ============================================
 
     // Handle clarification request from server
     handleClarificationRequest(data) {
@@ -473,15 +680,20 @@ class ChatApp {
         this.messageInput.value = '';
         this.messageInput.style.height = 'auto';
 
-        // Clear debug log for new message
+        // Clear logs for new message
         if (this.debugMode) {
             this.clearDebugLog();
         }
+        if (this.vizMode) {
+            this.clearVizLog();
+        }
 
-        // Send with debug flag
+        // Send with debug flag (viz mode also requires debug mode on server)
+        const debugFlag = this.debugMode || this.vizMode;
+        console.log('[VIZ] Sending chat with debug:', debugFlag, 'debugMode:', this.debugMode, 'vizMode:', this.vizMode);
         this.socket.emit('chat', {
             content,
-            debug: this.debugMode
+            debug: debugFlag
         });
 
         this.enableInput(false);

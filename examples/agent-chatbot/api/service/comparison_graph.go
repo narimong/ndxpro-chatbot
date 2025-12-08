@@ -30,14 +30,18 @@ package service
 import (
 	"context"
 	"fmt"
+	"log"
 	"math"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
+	"github.com/google/uuid"
 
+	apimodel "agent-chatbot/api/model"
 	"agent-chatbot/api/service/db"
 	"agent-chatbot/api/service/tools"
 )
@@ -259,8 +263,8 @@ func (s *ComparisonGraphService) retrieveEntityData(
 	mu *sync.Mutex,
 ) error {
 	s.emitDebug("entity_retrieval_start", map[string]any{
-		"entity":     entity.OriginalName,
-		"resolved":   entity.ResolvedName,
+		"entity":      entity.OriginalName,
+		"resolved":    entity.ResolvedName,
 		"source_uuid": entity.ResolvedUUID,
 	})
 
@@ -276,6 +280,8 @@ func (s *ComparisonGraphService) retrieveEntityData(
 		}
 	}
 
+	startTime := time.Now()
+
 	// Retrieve hierarchical data if UUID is available
 	if entity.ResolvedUUID != "" {
 		docs, err = s.graphRAGRetriever.RetrieveWithHierarchyByUUID(
@@ -289,6 +295,11 @@ func (s *ComparisonGraphService) retrieveEntityData(
 		// Fallback to regular retrieval
 		docs, err = s.graphRAGRetriever.Retrieve(ctx, entity.OriginalName+" "+state.Query.CompareAspect)
 	}
+
+	retrievalDuration := time.Since(startTime)
+
+	// Emit viz events for comparison entity retrieval
+	s.emitVizForComparisonEntity(entity, targetLabels, docs, retrievalDuration)
 
 	// Update state
 	mu.Lock()
@@ -317,6 +328,126 @@ func (s *ComparisonGraphService) retrieveEntityData(
 	})
 
 	return nil
+}
+
+// emitVizForComparisonEntity emits viz events for a comparison entity retrieval
+func (s *ComparisonGraphService) emitVizForComparisonEntity(
+	entity ResolvedEntity,
+	targetLabels []string,
+	docs []*schema.Document,
+	duration time.Duration,
+) {
+	if s.debugEmitter == nil {
+		return
+	}
+
+	var vizNodes []apimodel.VizNode
+	var vizEdges []apimodel.VizEdge
+
+	// Emit viz:cypher for the hierarchical query
+	cypherViz := apimodel.VizCypher{
+		QueryID:     uuid.New().String(),
+		Cypher:      fmt.Sprintf("MATCH (start {uuid: $uuid})-[*..4]->(score:%s)-[r:HAS_CHILD*0..4]->(child) RETURN score, child", strings.Join(targetLabels, "|")),
+		Params:      map[string]any{"uuid": entity.ResolvedUUID, "targetLabels": targetLabels},
+		ResultCount: len(docs),
+		Duration:    duration.Milliseconds(),
+		Source:      "comparison_graph.retrieveEntityData",
+		Timestamp:   time.Now().UnixMilli(),
+	}
+	log.Printf("[VIZ] Emitting viz:cypher (comparison entity %s): duration=%dms, results=%d", entity.ResolvedName, duration.Milliseconds(), len(docs))
+	s.debugEmitter(apimodel.EventVizCypher, cypherViz)
+
+	// Emit viz:node for the main entity
+	entityNode := apimodel.VizNode{
+		UUID:   entity.ResolvedUUID,
+		Name:   entity.ResolvedName,
+		Labels: []string{"Vehicle", entity.Role},
+		Depth:  0,
+		Source: "comparison_entity",
+	}
+	log.Printf("[VIZ] Emitting viz:node (comparison entity): %s (%s)", entity.ResolvedName, entity.Role)
+	s.debugEmitter(apimodel.EventVizNode, entityNode)
+	vizNodes = append(vizNodes, entityNode)
+
+	// Emit viz:node for each document (score nodes)
+	for i, doc := range docs {
+		nodeUUID := ""
+		nodeName := ""
+		nodeLabels := []string{}
+		parentUUID := entity.ResolvedUUID
+		depth := 1
+
+		if doc.MetaData != nil {
+			if u, ok := doc.MetaData["uuid"].(string); ok {
+				nodeUUID = u
+			}
+			if n, ok := doc.MetaData["name"].(string); ok {
+				nodeName = n
+			}
+			if l, ok := doc.MetaData["labels"].([]string); ok {
+				nodeLabels = l
+			}
+			if p, ok := doc.MetaData["parent_uuid"].(string); ok {
+				parentUUID = p
+			}
+			if d, ok := doc.MetaData["depth"].(int); ok {
+				depth = d
+			}
+		}
+
+		if nodeUUID == "" {
+			nodeUUID = doc.ID
+		}
+		if nodeName == "" {
+			nodeName = fmt.Sprintf("Score_%d", i+1)
+		}
+
+		vizNode := apimodel.VizNode{
+			UUID:       nodeUUID,
+			Name:       nodeName,
+			Labels:     nodeLabels,
+			Depth:      depth,
+			ParentUUID: parentUUID,
+			Source:     "comparison_score",
+		}
+		log.Printf("[VIZ] Emitting viz:node (comparison score %d): %s", i+1, nodeName)
+		s.debugEmitter(apimodel.EventVizNode, vizNode)
+		vizNodes = append(vizNodes, vizNode)
+
+		// Emit edge from parent to this node
+		if parentUUID != "" && nodeUUID != "" {
+			vizEdge := apimodel.VizEdge{
+				ID:           fmt.Sprintf("%s-HAS_SCORE-%s", parentUUID, nodeUUID),
+				FromUUID:     parentUUID,
+				ToUUID:       nodeUUID,
+				Relationship: "HAS_SCORE",
+				Direction:    "outgoing",
+			}
+			s.debugEmitter(apimodel.EventVizEdge, vizEdge)
+			vizEdges = append(vizEdges, vizEdge)
+		}
+	}
+
+	// Emit viz:complete for this entity
+	vizComplete := apimodel.VizCompletePayload{
+		Nodes:         vizNodes,
+		Edges:         vizEdges,
+		CypherQueries: []apimodel.VizCypher{cypherViz},
+		AnswerNodeIDs: func() []string {
+			ids := make([]string, 0, len(docs))
+			for _, doc := range docs {
+				if doc.MetaData != nil {
+					if u, ok := doc.MetaData["uuid"].(string); ok {
+						ids = append(ids, u)
+					}
+				}
+			}
+			return ids
+		}(),
+		Timestamp: time.Now().UnixMilli(),
+	}
+	log.Printf("[VIZ] Emitting viz:complete (comparison entity %s): %d nodes, %d edges", entity.ResolvedName, len(vizNodes), len(vizEdges))
+	s.debugEmitter(apimodel.EventVizComplete, vizComplete)
 }
 
 // extractScoreData extracts score data from documents.

@@ -3,12 +3,16 @@ package service
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
+	"time"
 
+	apimodel "agent-chatbot/api/model"
 	"agent-chatbot/api/service/db"
 	"agent-chatbot/api/service/tools"
 
 	"github.com/cloudwego/eino/schema"
+	"github.com/google/uuid"
 )
 
 // ConditionalRetriever handles exploration-first conditional queries
@@ -135,7 +139,12 @@ func (r *ConditionalRetriever) RetrieveWithCondition(
 		"filters":       propFilters,
 	})
 
-	// Step 6: Format as documents
+	// Step 6: Emit viz events for visualization
+	cypherQuery := fmt.Sprintf("MATCH (anchor {uuid: $anchorUUID})-[r:%s]-(target:%s) RETURN target LIMIT %d",
+		matchedRel.RelType, matchedRel.ConnectedLabel, topK)
+	r.emitVizEvents(anchorNode, matchedRel, results, cypherQuery)
+
+	// Step 7: Format as documents
 	return r.formatResultsAsDocuments(anchorNode, matchedRel, results, total)
 }
 
@@ -328,7 +337,12 @@ func (r *ConditionalRetriever) RetrieveWithConditionAndTargetLabels(
 		"filters":       propFilters,
 	})
 
-	// Step 6: Format as documents
+	// Step 6: Emit viz events for visualization (with target labels)
+	cypherQuery := fmt.Sprintf("MATCH (anchor {uuid: $anchorUUID})-[r:%s]-(target:%s) WHERE target:%s RETURN target LIMIT %d",
+		matchedRel.RelType, matchedRel.ConnectedLabel, strings.Join(targetLabels, ":"), topK)
+	r.emitVizEvents(anchorNode, matchedRel, results, cypherQuery)
+
+	// Step 7: Format as documents
 	return r.formatResultsAsDocuments(anchorNode, matchedRel, results, total)
 }
 
@@ -472,6 +486,127 @@ func (r *ConditionalRetriever) emitDebug(event string, data map[string]any) {
 			Data:    data,
 		})
 	}
+}
+
+// SetDebugEmitter sets the debug emitter dynamically
+func (r *ConditionalRetriever) SetDebugEmitter(emitter DebugEmitter) {
+	r.debugEmitter = emitter
+}
+
+// emitVizEvents emits visualization events for conditional query results
+func (r *ConditionalRetriever) emitVizEvents(
+	anchor *tools.NodeCandidate,
+	rel *db.RelationshipSchemaInfo,
+	results []map[string]any,
+	cypherQuery string,
+) {
+	if r.debugEmitter == nil {
+		return
+	}
+
+	startTime := time.Now()
+	var vizNodes []apimodel.VizNode
+	var vizEdges []apimodel.VizEdge
+
+	// Emit anchor node
+	anchorVizNode := apimodel.VizNode{
+		UUID:   anchor.UUID,
+		Name:   anchor.Name,
+		Labels: anchor.Labels,
+		Depth:  0,
+		Source: "conditional_anchor",
+	}
+	log.Printf("[VIZ] Emitting viz:node (conditional anchor): %s", anchor.Name)
+	r.debugEmitter(apimodel.EventVizNode, anchorVizNode)
+	vizNodes = append(vizNodes, anchorVizNode)
+
+	// Emit viz:cypher for the query
+	cypherViz := apimodel.VizCypher{
+		QueryID:     uuid.New().String(),
+		Cypher:      cypherQuery,
+		Params:      map[string]any{"anchorUUID": anchor.UUID, "relationship": rel.RelType},
+		ResultCount: len(results),
+		Duration:    time.Since(startTime).Milliseconds(),
+		Source:      "conditional_retriever",
+		Timestamp:   time.Now().UnixMilli(),
+	}
+	log.Printf("[VIZ] Emitting viz:cypher (conditional): %s", cypherQuery)
+	r.debugEmitter(apimodel.EventVizCypher, cypherViz)
+
+	// Emit result nodes and edges
+	for i, node := range results {
+		nodeUUID := ""
+		nodeName := ""
+		nodeLabels := []string{}
+
+		if u, ok := node["uuid"].(string); ok {
+			nodeUUID = u
+		}
+		if n, ok := node["name"].(string); ok {
+			nodeName = n
+		}
+		if l, ok := node["labels"].([]string); ok {
+			nodeLabels = l
+		} else if rel.ConnectedLabel != "" {
+			nodeLabels = []string{rel.ConnectedLabel}
+		}
+
+		// Emit viz:node for each result
+		vizNode := apimodel.VizNode{
+			UUID:       nodeUUID,
+			Name:       nodeName,
+			Labels:     nodeLabels,
+			Depth:      1,
+			ParentUUID: anchor.UUID,
+			Source:     "conditional_result",
+		}
+		log.Printf("[VIZ] Emitting viz:node (conditional result %d): %s", i+1, nodeName)
+		r.debugEmitter(apimodel.EventVizNode, vizNode)
+		vizNodes = append(vizNodes, vizNode)
+
+		// Emit viz:edge for relationship
+		if nodeUUID != "" {
+			edgeID := fmt.Sprintf("%s-%s-%s", anchor.UUID, rel.RelType, nodeUUID)
+			var fromUUID, toUUID string
+			if rel.Direction == "outgoing" {
+				fromUUID = anchor.UUID
+				toUUID = nodeUUID
+			} else {
+				fromUUID = nodeUUID
+				toUUID = anchor.UUID
+			}
+
+			vizEdge := apimodel.VizEdge{
+				ID:           edgeID,
+				FromUUID:     fromUUID,
+				ToUUID:       toUUID,
+				Relationship: rel.RelType,
+				Direction:    rel.Direction,
+			}
+			log.Printf("[VIZ] Emitting viz:edge (conditional): %s -[%s]-> %s", fromUUID, rel.RelType, toUUID)
+			r.debugEmitter(apimodel.EventVizEdge, vizEdge)
+			vizEdges = append(vizEdges, vizEdge)
+		}
+	}
+
+	// Emit viz:complete with all collected data
+	vizComplete := apimodel.VizCompletePayload{
+		Nodes:         vizNodes,
+		Edges:         vizEdges,
+		CypherQueries: []apimodel.VizCypher{cypherViz},
+		AnswerNodeIDs: func() []string {
+			ids := make([]string, 0, len(results))
+			for _, node := range results {
+				if u, ok := node["uuid"].(string); ok {
+					ids = append(ids, u)
+				}
+			}
+			return ids
+		}(),
+		Timestamp: time.Now().UnixMilli(),
+	}
+	log.Printf("[VIZ] Emitting viz:complete (conditional): %d nodes, %d edges", len(vizNodes), len(vizEdges))
+	r.debugEmitter(apimodel.EventVizComplete, vizComplete)
 }
 
 // RetrieveByRelationship is a helper method for direct relationship traversal

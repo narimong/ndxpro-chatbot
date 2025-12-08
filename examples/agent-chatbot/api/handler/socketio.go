@@ -169,6 +169,10 @@ func (h *SocketIOHandler) handleChat(socket *socketio.Socket, event *socketio.Ev
 	// Create debug emitter for clarification request storage
 	var pendingClarificationReq *service.ClarificationRequest
 	emitter := func(event string, eventData interface{}) {
+		// viz 이벤트 로깅
+		if strings.HasPrefix(event, "viz:") {
+			log.Printf("[VIZ] Emitting event: %s, data type: %T", event, eventData)
+		}
 		socket.Emit(event, eventData)
 		// Store clarification request if emitted
 		if event == "clarification:request" {
@@ -182,9 +186,19 @@ func (h *SocketIOHandler) handleChat(socket *socketio.Socket, event *socketio.Ev
 		}
 	}
 
+	log.Printf("[VIZ] debugMode=%v, AgentModeEnabled=%v", debugMode, h.chatService.IsAgentModeEnabled())
 	if debugMode {
-		streamReader, err = h.chatService.ChatStreamWithDebug(ctx, sessionID, content, emitter)
+		// 에이전트 모드가 활성화되어 있으면 ChatWithAgent 사용
+		// ChatWithAgent에서 vizCollector가 생성되고 viz 이벤트가 발송됨
+		if h.chatService.IsAgentModeEnabled() {
+			log.Printf("[VIZ] Using ChatWithAgent - viz events will be emitted")
+			streamReader, err = h.chatService.ChatWithAgent(ctx, sessionID, content, emitter)
+		} else {
+			log.Printf("[VIZ] Using ChatStreamWithDebug - no viz events")
+			streamReader, err = h.chatService.ChatStreamWithDebug(ctx, sessionID, content, emitter)
+		}
 	} else {
+		log.Printf("[VIZ] Using ChatStream (no debug mode) - no viz events")
 		streamReader, err = h.chatService.ChatStream(ctx, sessionID, content)
 	}
 

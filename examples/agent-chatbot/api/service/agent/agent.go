@@ -3,9 +3,14 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log"
 	"strings"
+	"time"
 
+	apiModel "agent-chatbot/api/model"
 	"agent-chatbot/api/service/agent/tools"
 	"agent-chatbot/api/service/db"
 
@@ -13,6 +18,7 @@ import (
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
+	"github.com/google/uuid"
 )
 
 const (
@@ -110,7 +116,12 @@ func (a *GraphRAGAgent) buildGraph(ctx context.Context) error {
 	// Create graph with local state
 	graph := compose.NewGraph[[]*schema.Message, *schema.Message](
 		compose.WithGenLocalState(func(ctx context.Context) *AgentState {
-			return NewAgentState(a.config.MaxIterations)
+			state := NewAgentState(a.config.MaxIterations)
+			// Inject visualization collector from context if available
+			if vc, ok := ctx.Value(vizCollectorKey).(*VisualizationCollector); ok {
+				state.Visualization = vc
+			}
+			return state
 		}),
 	)
 
@@ -126,9 +137,14 @@ func (a *GraphRAGAgent) buildGraph(ctx context.Context) error {
 					break
 				}
 			}
+			// Only add input messages on the first iteration
+			// Subsequent iterations receive tool outputs which are already in state.Messages
+			state.Messages = append(state.Messages, input...)
 		}
+		// Note: On iteration 2+, input comes from tools node output,
+		// but those messages are already added by toolsPostHandle,
+		// so we don't add them again here.
 
-		state.Messages = append(state.Messages, input...)
 		state.Iteration++
 
 		// Debug event
@@ -170,13 +186,24 @@ func (a *GraphRAGAgent) buildGraph(ctx context.Context) error {
 		if input != nil {
 			state.Messages = append(state.Messages, input)
 
-			// Debug: log tool calls
+			// Debug: log tool calls and track attempted queries
 			if len(input.ToolCalls) > 0 {
 				for _, tc := range input.ToolCalls {
 					a.emitDebug("agent:tool_call", map[string]any{
 						"tool_name": tc.Function.Name,
 						"arguments": tc.Function.Arguments,
 					})
+
+					// Track search queries for graph_search tool
+					if tc.Function.Name == "graph_search" {
+						var args struct {
+							Query string `json:"query"`
+						}
+						if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err == nil && args.Query != "" {
+							state.SearchContext.AddAttemptedQuery(args.Query)
+							log.Printf("[DEBUG] Added attempted query: %s", args.Query)
+						}
+					}
 				}
 			}
 		}
@@ -466,11 +493,17 @@ func (a *GraphRAGAgent) updateStateFromToolResult(state *AgentState, msg *schema
 
 	// Try to determine which tool was called and update state accordingly
 	content := msg.Content
+	toolCallID := msg.ToolCallID
+
+	log.Printf("[DEBUG] updateStateFromToolResult: processing tool result, toolCallID=%s, content_len=%d",
+		toolCallID, len(content))
 
 	// Check for graph_search results
 	if strings.Contains(content, `"nodes"`) && strings.Contains(content, `"total_found"`) {
 		var result tools.GraphSearchOutput
 		if err := parseJSON(content, &result); err == nil {
+			log.Printf("[DEBUG] Parsed graph_search result: total_found=%d, success=%v",
+				result.TotalFound, result.Success)
 			// Add discovered nodes with Properties
 			for _, node := range result.Nodes {
 				state.SearchContext.AddDiscoveredNode(NodeInfo{
@@ -493,7 +526,24 @@ func (a *GraphRAGAgent) updateStateFromToolResult(state *AgentState, msg *schema
 					},
 				}
 				state.SearchContext.AddCollectedDoc(doc)
+
+				// 가시화 데이터 추가
+				if state.Visualization != nil {
+					vizNode := apiModel.VizNode{
+						UUID:       node.UUID,
+						Name:       node.Name,
+						Labels:     node.Labels,
+						Properties: node.Properties,
+						Score:      node.Score,
+						Source:     "graph_search",
+					}
+					state.Visualization.AddNode(vizNode)
+					state.Visualization.EmitNode(vizNode)
+				}
 			}
+		} else {
+			log.Printf("[WARN] Failed to parse graph_search result: %v, content: %s",
+				err, truncateForLog(content, 200))
 		}
 	}
 
@@ -501,6 +551,8 @@ func (a *GraphRAGAgent) updateStateFromToolResult(state *AgentState, msg *schema
 	if strings.Contains(content, `"is_sufficient"`) && strings.Contains(content, `"confidence"`) {
 		var result tools.EvaluateOutput
 		if err := parseJSON(content, &result); err == nil {
+			log.Printf("[DEBUG] Parsed evaluate_results: is_sufficient=%v, confidence=%.2f",
+				result.IsSufficient, result.Confidence)
 			state.EvaluationResult = &EvaluationResult{
 				IsSufficient:    result.IsSufficient,
 				Confidence:      result.Confidence,
@@ -513,6 +565,9 @@ func (a *GraphRAGAgent) updateStateFromToolResult(state *AgentState, msg *schema
 			if result.IsSufficient && result.Confidence >= a.config.ConfidenceThreshold {
 				state.ShouldStop = true
 			}
+		} else {
+			log.Printf("[WARN] Failed to parse evaluate_results: %v, content: %s",
+				err, truncateForLog(content, 200))
 		}
 	}
 
@@ -520,6 +575,25 @@ func (a *GraphRAGAgent) updateStateFromToolResult(state *AgentState, msg *schema
 	if strings.Contains(content, `"results"`) && strings.Contains(content, `"mode_used"`) {
 		var result tools.ExploreOutput
 		if err := parseJSON(content, &result); err == nil {
+			log.Printf("[DEBUG] Parsed explore_relations result: mode=%s, results_count=%d, success=%v",
+				result.Mode, len(result.Results), result.Success)
+			// 가시화: 시작 노드 추가
+			if state.Visualization != nil && result.StartNode.UUID != "" {
+				startVizNode := apiModel.VizNode{
+					UUID:   result.StartNode.UUID,
+					Name:   result.StartNode.Name,
+					Labels: result.StartNode.Labels,
+					Source: "explore_relations",
+				}
+				state.Visualization.AddNode(startVizNode)
+				state.Visualization.EmitNode(startVizNode)
+
+				// hierarchy 모드면 root 설정
+				if result.Mode == "hierarchy" {
+					state.Visualization.SetHierarchyRoot(result.StartNode.UUID)
+				}
+			}
+
 			for _, r := range result.Results {
 				if r.TargetNode.UUID != "" {
 					state.SearchContext.AddDiscoveredNode(NodeInfo{
@@ -541,9 +615,62 @@ func (a *GraphRAGAgent) updateStateFromToolResult(state *AgentState, msg *schema
 						},
 					}
 					state.SearchContext.AddCollectedDoc(doc)
+
+					// 가시화 데이터 추가 (재귀적으로 자식 포함)
+					if state.Visualization != nil {
+						addExploreResultToVisualization(state.Visualization, result.StartNode.UUID, r)
+					}
 				}
 			}
+		} else {
+			log.Printf("[WARN] Failed to parse explore_relations result: %v, content: %s",
+				err, truncateForLog(content, 200))
 		}
+	}
+
+	log.Printf("[DEBUG] State after tool result: discovered_nodes=%d, collected_docs=%d",
+		len(state.SearchContext.DiscoveredNodes), len(state.SearchContext.CollectedDocs))
+}
+
+// truncateForLog truncates a string for logging purposes
+func truncateForLog(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+// addExploreResultToVisualization recursively adds explore results to visualization
+func addExploreResultToVisualization(vc *VisualizationCollector, parentUUID string, r tools.ExploreResult) {
+	// 노드 추가
+	vizNode := apiModel.VizNode{
+		UUID:       r.TargetNode.UUID,
+		Name:       r.TargetNode.Name,
+		Labels:     r.TargetNode.Labels,
+		Properties: r.Properties,
+		Depth:      r.Depth,
+		ParentUUID: parentUUID,
+		Source:     "explore_relations",
+	}
+	vc.AddNode(vizNode)
+	vc.EmitNode(vizNode)
+
+	// 관계 추가
+	if parentUUID != "" && r.TargetNode.UUID != "" {
+		vizEdge := apiModel.VizEdge{
+			ID:           uuid.New().String(),
+			FromUUID:     parentUUID,
+			ToUUID:       r.TargetNode.UUID,
+			Relationship: r.Relationship,
+			Direction:    r.Direction,
+		}
+		vc.AddEdge(vizEdge)
+		vc.EmitEdge(vizEdge)
+	}
+
+	// 자식 재귀 처리
+	for _, child := range r.Children {
+		addExploreResultToVisualization(vc, r.TargetNode.UUID, child)
 	}
 }
 
@@ -655,14 +782,22 @@ func (a *GraphRAGAgent) generateFinalAnswer(ctx context.Context, messages []*sch
 	// Get state
 	var collectedContext string
 	var originalQuery string
+	var discoveredNodesCount int
+	var collectedDocsCount int
 	err := compose.ProcessState[*AgentState](ctx, func(ctx context.Context, state *AgentState) error {
 		collectedContext = state.GetCollectedContext()
 		originalQuery = state.OriginalQuery
+		discoveredNodesCount = len(state.SearchContext.DiscoveredNodes)
+		collectedDocsCount = len(state.SearchContext.CollectedDocs)
 		return nil
 	})
 	if err != nil {
+		log.Printf("[WARN] generateFinalAnswer: failed to get state: %v", err)
 		collectedContext = ""
 	}
+
+	log.Printf("[DEBUG] generateFinalAnswer: originalQuery=%s, collectedContext_len=%d, discoveredNodes=%d, collectedDocs=%d",
+		truncateForLog(originalQuery, 50), len(collectedContext), discoveredNodesCount, collectedDocsCount)
 
 	// Find original query from messages if not in state
 	if originalQuery == "" {
@@ -672,6 +807,8 @@ func (a *GraphRAGAgent) generateFinalAnswer(ctx context.Context, messages []*sch
 				break
 			}
 		}
+		log.Printf("[DEBUG] generateFinalAnswer: extracted originalQuery from messages: %s",
+			truncateForLog(originalQuery, 50))
 	}
 
 	// Build system prompt with formatting guidelines (Chain 모드의 ragSystemPrompt 스타일 적용)
@@ -717,6 +854,7 @@ func (a *GraphRAGAgent) generateFinalAnswer(ctx context.Context, messages []*sch
 		userPrompt.WriteString(collectedContext)
 		userPrompt.WriteString("\n\n")
 	} else {
+		log.Printf("[WARN] generateFinalAnswer: collectedContext is empty! Agent may have failed to collect any data.")
 		userPrompt.WriteString("## 수집된 정보\n")
 		userPrompt.WriteString("검색 결과가 없습니다.\n\n")
 	}
@@ -832,9 +970,116 @@ func isHierarchicalQuery(query string) bool {
 
 // StreamWithDebug runs the agent with a debug emitter and returns streaming response
 func (a *GraphRAGAgent) StreamWithDebug(ctx context.Context, messages []*schema.Message, emitter DebugEmitter) (*schema.StreamReader[*schema.Message], error) {
+	// Delegate to internal implementation without pre-verified context
+	return a.streamWithDebugInternal(ctx, messages, emitter)
+}
+
+// vizCollectorKey is the context key for visualization collector
+type vizCollectorKeyType struct{}
+
+var vizCollectorKey = vizCollectorKeyType{}
+
+// AgentContext contains verified information from ClarificationOrchestrator
+// This allows the agent to start with pre-verified context instead of searching from scratch
+type AgentContext struct {
+	SourceNodeUUID string   // UUID of the verified source node
+	SourceNodeName string   // Name of the source node for display
+	TargetLabels   []string // Expected target labels (e.g., PerformanceTotalScore)
+	IsHierarchical bool     // Whether this is a hierarchical query (needs depth exploration)
+}
+
+// agentContextKey is the context key for agent context
+type agentContextKeyType struct{}
+
+var agentContextKey = agentContextKeyType{}
+
+// StreamWithDebugAndContext runs the agent with pre-verified context from ClarificationOrchestrator
+func (a *GraphRAGAgent) StreamWithDebugAndContext(
+	ctx context.Context,
+	messages []*schema.Message,
+	emitter DebugEmitter,
+	agentCtx *AgentContext,
+) (*schema.StreamReader[*schema.Message], error) {
+	// Inject verified context into the context
+	ctxWithAgentContext := context.WithValue(ctx, agentContextKey, agentCtx)
+
+	// If we have verified context, inject it into the system message
+	if agentCtx != nil && agentCtx.SourceNodeUUID != "" {
+		contextHint := a.buildContextHint(agentCtx)
+		messages = a.injectContextHint(messages, contextHint)
+		log.Printf("[DEBUG] StreamWithDebugAndContext: Injected context hint for sourceNode=%s", agentCtx.SourceNodeName)
+	}
+
+	return a.streamWithDebugInternal(ctxWithAgentContext, messages, emitter)
+}
+
+// buildContextHint creates a context hint string from AgentContext
+func (a *GraphRAGAgent) buildContextHint(agentCtx *AgentContext) string {
+	var sb strings.Builder
+	sb.WriteString("\n\n## 🎯 검증된 시작점 (Pre-Verified Context)\n")
+	sb.WriteString(fmt.Sprintf("- **시작 노드**: %s\n", agentCtx.SourceNodeName))
+	sb.WriteString(fmt.Sprintf("- **UUID**: %s\n", agentCtx.SourceNodeUUID))
+
+	if len(agentCtx.TargetLabels) > 0 {
+		sb.WriteString(fmt.Sprintf("- **타겟 레이블**: %s\n", strings.Join(agentCtx.TargetLabels, ", ")))
+	}
+
+	if agentCtx.IsHierarchical {
+		sb.WriteString("- **쿼리 타입**: 계층적 (hierarchy 탐색 필요)\n")
+		sb.WriteString("\n⚠️ 이 정보는 이미 검증되었습니다. graph_search 대신 explore_relations를 사용하여 바로 탐색하세요.\n")
+		sb.WriteString(fmt.Sprintf("예: explore_relations(start_uuid=\"%s\", explore_mode=\"hierarchy\", max_depth=4)\n", agentCtx.SourceNodeUUID))
+	} else {
+		sb.WriteString("\n이 노드를 시작점으로 관계를 탐색하세요.\n")
+	}
+
+	return sb.String()
+}
+
+// injectContextHint adds context hint to messages
+func (a *GraphRAGAgent) injectContextHint(messages []*schema.Message, hint string) []*schema.Message {
+	if len(messages) == 0 {
+		return messages
+	}
+
+	// Find the last user message and append the hint
+	result := make([]*schema.Message, len(messages))
+	copy(result, messages)
+
+	for i := len(result) - 1; i >= 0; i-- {
+		if result[i].Role == schema.User {
+			// Create a new message with the hint appended
+			newContent := result[i].Content + hint
+			result[i] = schema.UserMessage(newContent)
+			break
+		}
+	}
+
+	return result
+}
+
+// streamWithDebugInternal is the internal implementation shared by both StreamWithDebug and StreamWithDebugAndContext
+func (a *GraphRAGAgent) streamWithDebugInternal(ctx context.Context, messages []*schema.Message, emitter DebugEmitter) (*schema.StreamReader[*schema.Message], error) {
 	// Set the debug emitter temporarily for this run
 	originalEmitter := a.config.DebugEmitter
 	a.config.DebugEmitter = emitter
+
+	// Create visualization collector
+	vizCollector := NewVisualizationCollector(emitter)
+
+	// Set up Cypher query logger for visualization
+	a.config.Neo4jClient.SetQueryLogger(func(cypher string, params map[string]any, resultCount int, duration time.Duration, source string) {
+		vizQuery := apiModel.VizCypher{
+			QueryID:     uuid.New().String(),
+			Cypher:      cypher,
+			Params:      params,
+			ResultCount: resultCount,
+			Duration:    duration.Milliseconds(),
+			Source:      source,
+			Timestamp:   time.Now().UnixMilli(),
+		}
+		vizCollector.AddCypherQuery(vizQuery)
+		vizCollector.EmitCypher(vizQuery)
+	})
 
 	// Emit agent start
 	a.emitDebug("agent:start", map[string]any{
@@ -843,9 +1088,11 @@ func (a *GraphRAGAgent) StreamWithDebug(ctx context.Context, messages []*schema.
 		"tools_count":          len(a.tools),
 	})
 
-	// Run the agent
-	streamReader, err := a.runnable.Stream(ctx, messages)
+	// Run the agent with visualization collector in context
+	ctxWithViz := context.WithValue(ctx, vizCollectorKey, vizCollector)
+	streamReader, err := a.runnable.Stream(ctxWithViz, messages)
 	if err != nil {
+		a.config.Neo4jClient.ClearQueryLogger()
 		a.config.DebugEmitter = originalEmitter
 		return nil, err
 	}
@@ -856,8 +1103,20 @@ func (a *GraphRAGAgent) StreamWithDebug(ctx context.Context, messages []*schema.
 	go func() {
 		defer writer.Close()
 		defer func() {
+			// Clear Cypher query logger
+			a.config.Neo4jClient.ClearQueryLogger()
+
+			// Emit final visualization data
+			if vizCollector != nil {
+				payload := vizCollector.GetCompletePayload()
+				emitter(apiModel.EventVizComplete, payload)
+			}
+
 			a.emitDebug("agent:complete", map[string]any{
-				"status": "completed",
+				"status":      "completed",
+				"nodes_found": vizCollector.GetNodeCount(),
+				"edges_found": vizCollector.GetEdgeCount(),
+				"queries_run": vizCollector.GetQueryCount(),
 			})
 			a.config.DebugEmitter = originalEmitter
 		}()
@@ -865,6 +1124,9 @@ func (a *GraphRAGAgent) StreamWithDebug(ctx context.Context, messages []*schema.
 		for {
 			msg, recvErr := streamReader.Recv()
 			if recvErr != nil {
+				if !errors.Is(recvErr, io.EOF) {
+					log.Printf("[ERROR] Agent stream recv failed: %v", recvErr)
+				}
 				return
 			}
 			writer.Send(msg, nil)

@@ -2,7 +2,9 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"strings"
 	"sync"
@@ -14,6 +16,7 @@ import (
 	"github.com/cloudwego/eino/components/retriever"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
+	"github.com/google/uuid"
 
 	"agent-chatbot/api/config"
 	apimodel "agent-chatbot/api/model"
@@ -289,7 +292,7 @@ func (c *ChatService) ChatStreamWithDebug(
 			c.sessionStore.ClearPendingComparisonClarification(sessionID)
 
 			// Comparison query processed successfully - stream response with comparison context
-			return c.streamComparisonResponse(ctx, session, input, result)
+			return c.streamComparisonResponseWithViz(ctx, session, input, result, emitter)
 		}
 
 		// Not a comparison query - continue with regular flow
@@ -581,6 +584,9 @@ func (c *ChatService) retrieveWithDebug(ctx context.Context, queries []string, e
 				Timestamp:     time.Now().UnixMilli(),
 			})
 
+			// Emit viz events for retrieval results
+			c.emitVizForRetrieval(q, docs, duration, emitter)
+
 			// Merge results with deduplication
 			mu.Lock()
 			for _, doc := range docs {
@@ -595,6 +601,79 @@ func (c *ChatService) retrieveWithDebug(ctx context.Context, queries []string, e
 
 	wg.Wait()
 	return allDocs
+}
+
+// emitVizForRetrieval emits viz events for general retrieval results
+func (c *ChatService) emitVizForRetrieval(query string, docs []*schema.Document, duration int64, emitter DebugEmitter) {
+	if emitter == nil {
+		return
+	}
+
+	var vizNodes []apimodel.VizNode
+
+	// Emit viz:cypher for the retrieval query
+	cypherViz := apimodel.VizCypher{
+		QueryID:     uuid.New().String(),
+		Cypher:      fmt.Sprintf("// Full-text search: %s", query),
+		Params:      map[string]any{"query": query},
+		ResultCount: len(docs),
+		Duration:    duration,
+		Source:      "chat.retrieveWithDebug",
+		Timestamp:   time.Now().UnixMilli(),
+	}
+	log.Printf("[VIZ] Emitting viz:cypher (retrieveWithDebug): query=%s, results=%d", query, len(docs))
+	emitter(apimodel.EventVizCypher, cypherViz)
+
+	// Emit viz:node for each document
+	for i, doc := range docs {
+		nodeUUID := doc.ID
+		nodeName := ""
+		nodeLabels := []string{}
+
+		if doc.MetaData != nil {
+			if n, ok := doc.MetaData["name"].(string); ok {
+				nodeName = n
+			}
+			if l, ok := doc.MetaData["labels"].([]string); ok {
+				nodeLabels = l
+			}
+			if u, ok := doc.MetaData["uuid"].(string); ok {
+				nodeUUID = u
+			}
+		}
+
+		if nodeName == "" {
+			nodeName = fmt.Sprintf("Result_%d", i+1)
+		}
+
+		vizNode := apimodel.VizNode{
+			UUID:   nodeUUID,
+			Name:   nodeName,
+			Labels: nodeLabels,
+			Depth:  0,
+			Source: "general_retrieval",
+		}
+		log.Printf("[VIZ] Emitting viz:node (retrieveWithDebug %d): %s", i+1, nodeName)
+		emitter(apimodel.EventVizNode, vizNode)
+		vizNodes = append(vizNodes, vizNode)
+	}
+
+	// Emit viz:complete
+	vizComplete := apimodel.VizCompletePayload{
+		Nodes:         vizNodes,
+		Edges:         []apimodel.VizEdge{},
+		CypherQueries: []apimodel.VizCypher{cypherViz},
+		AnswerNodeIDs: func() []string {
+			ids := make([]string, 0, len(docs))
+			for _, doc := range docs {
+				ids = append(ids, doc.ID)
+			}
+			return ids
+		}(),
+		Timestamp: time.Now().UnixMilli(),
+	}
+	log.Printf("[VIZ] Emitting viz:complete (retrieveWithDebug): %d nodes", len(vizNodes))
+	emitter(apimodel.EventVizComplete, vizComplete)
 }
 
 // buildRAGSystemPrompt builds the system prompt with plan and retrieved context
@@ -824,6 +903,56 @@ func (c *ChatService) processClarificationResponseInternal(
 			},
 			Timestamp: time.Now().UnixMilli(),
 		})
+
+		// Emit viz events for retrieved documents
+		for _, doc := range decision.Documents {
+			vizNode := apimodel.VizNode{
+				UUID:   doc.ID,
+				Name:   doc.ID,
+				Labels: []string{"Document"},
+				Score:  0.0,
+				Source: "clarification_response",
+			}
+			// Extract metadata if available
+			if uuid, ok := doc.MetaData["source_uuid"].(string); ok {
+				vizNode.UUID = uuid
+			}
+			if name, ok := doc.MetaData["name"].(string); ok {
+				vizNode.Name = name
+			}
+			if labels, ok := doc.MetaData["labels"].([]string); ok {
+				vizNode.Labels = labels
+			}
+			if score, ok := doc.MetaData["score"].(float64); ok {
+				vizNode.Score = score
+			}
+			if depth, ok := doc.MetaData["depth"].(int); ok {
+				vizNode.Depth = depth
+			}
+			if parentUUID, ok := doc.MetaData["parent_uuid"].(string); ok {
+				vizNode.ParentUUID = parentUUID
+			}
+			log.Printf("[VIZ] Emitting viz:node from clarification: %s", vizNode.Name)
+			emitter(apimodel.EventVizNode, vizNode)
+		}
+
+		// Emit viz:complete
+		vizPayload := &apimodel.VizCompletePayload{
+			Nodes:         make([]apimodel.VizNode, 0),
+			Edges:         make([]apimodel.VizEdge, 0),
+			CypherQueries: make([]apimodel.VizCypher, 0),
+			AnswerNodeIDs: make([]string, 0, len(decision.Documents)),
+			Timestamp:     time.Now().UnixMilli(),
+		}
+		for _, doc := range decision.Documents {
+			uuid := doc.ID
+			if u, ok := doc.MetaData["source_uuid"].(string); ok {
+				uuid = u
+			}
+			vizPayload.AnswerNodeIDs = append(vizPayload.AnswerNodeIDs, uuid)
+		}
+		log.Printf("[VIZ] Emitting viz:complete from clarification with %d answer nodes", len(vizPayload.AnswerNodeIDs))
+		emitter(apimodel.EventVizComplete, vizPayload)
 	}
 
 	// If still needs clarification (Phase 2), update pending and return clarification request
@@ -919,6 +1048,18 @@ func (c *ChatService) streamComparisonResponse(
 	input string,
 	result *ComparisonClarificationResult,
 ) (*schema.StreamReader[*schema.Message], error) {
+	noopEmitter := func(event string, data interface{}) {}
+	return c.streamComparisonResponseWithViz(ctx, session, input, result, noopEmitter)
+}
+
+// streamComparisonResponseWithViz streams a response for a completed comparison query with viz events.
+func (c *ChatService) streamComparisonResponseWithViz(
+	ctx context.Context,
+	session *apimodel.Session,
+	input string,
+	result *ComparisonClarificationResult,
+	emitter DebugEmitter,
+) (*schema.StreamReader[*schema.Message], error) {
 	// Execute comparison analysis using the resolved entities
 	if c.comparisonService == nil {
 		return nil, fmt.Errorf("comparison service not available")
@@ -934,6 +1075,11 @@ func (c *ChatService) streamComparisonResponse(
 		return nil, fmt.Errorf("comparison execution failed: %w", err)
 	}
 
+	// Emit viz events for comparison entities
+	if emitter != nil {
+		c.emitComparisonVizEvents(comparisonState, result.ResolvedEntities, emitter)
+	}
+
 	// Build comparison context from the analysis data
 	comparisonContext := c.comparisonService.BuildComparisonContext(comparisonState)
 
@@ -946,6 +1092,55 @@ func (c *ChatService) streamComparisonResponse(
 		"history":       session.History,
 		"input":         input,
 	})
+}
+
+// emitComparisonVizEvents emits viz events for comparison query results
+func (c *ChatService) emitComparisonVizEvents(state *ComparisonState, entities []ResolvedEntity, emitter DebugEmitter) {
+	if emitter == nil {
+		return
+	}
+
+	// Emit viz:node for each resolved entity
+	for _, entity := range entities {
+		vizNode := apimodel.VizNode{
+			UUID:   entity.ResolvedUUID,
+			Name:   entity.ResolvedName,
+			Labels: []string{"Vehicle", entity.Role}, // Role: subject, reference
+			Score:  0,
+			Source: "comparison_query",
+		}
+		log.Printf("[VIZ] Emitting viz:node (comparison entity): %s (%s)", entity.ResolvedName, entity.Role)
+		emitter(apimodel.EventVizNode, vizNode)
+	}
+
+	// Emit viz:edge for comparison relationship between entities
+	if len(entities) >= 2 {
+		vizEdge := apimodel.VizEdge{
+			ID:           fmt.Sprintf("comparison_%s_%s", entities[0].ResolvedUUID[:8], entities[1].ResolvedUUID[:8]),
+			FromUUID:     entities[0].ResolvedUUID,
+			ToUUID:       entities[1].ResolvedUUID,
+			Relationship: "COMPARED_WITH",
+			Direction:    "outgoing",
+		}
+		log.Printf("[VIZ] Emitting viz:edge (comparison): %s <-> %s", entities[0].ResolvedName, entities[1].ResolvedName)
+		emitter(apimodel.EventVizEdge, vizEdge)
+	}
+
+	// Emit viz:complete
+	answerNodeIDs := make([]string, 0, len(entities))
+	for _, entity := range entities {
+		answerNodeIDs = append(answerNodeIDs, entity.ResolvedUUID)
+	}
+
+	vizPayload := &apimodel.VizCompletePayload{
+		Nodes:         make([]apimodel.VizNode, 0),
+		Edges:         make([]apimodel.VizEdge, 0),
+		CypherQueries: make([]apimodel.VizCypher, 0),
+		AnswerNodeIDs: answerNodeIDs,
+		Timestamp:     time.Now().UnixMilli(),
+	}
+	log.Printf("[VIZ] Emitting viz:complete from comparison with %d answer nodes", len(answerNodeIDs))
+	emitter(apimodel.EventVizComplete, vizPayload)
 }
 
 // buildComparisonSystemPrompt builds a system prompt specifically for comparison queries.
@@ -1072,8 +1267,8 @@ func (c *ChatService) ProcessComparisonClarificationResponse(
 	// All entities resolved - clear pending and execute comparison
 	c.sessionStore.ClearPendingComparisonClarification(sessionID)
 
-	// Stream the comparison response
-	return c.streamComparisonResponse(ctx, session, pending.OriginalQuery, result)
+	// Stream the comparison response with viz events
+	return c.streamComparisonResponseWithViz(ctx, session, pending.OriginalQuery, result, emitter)
 }
 
 // ChatWithAgent handles streaming chat using the ReAct agent for iterative search
@@ -1092,7 +1287,178 @@ func (c *ChatService) ChatWithAgent(
 		return nil, err
 	}
 
-	// Emit agent mode started
+	// ============================================================
+	// [NEW] Step 0: Set emitter for all sub-components
+	// ============================================================
+	if graphRAG := c.GetGraphRAGRetriever(); graphRAG != nil {
+		graphRAG.SetDebugEmitter(emitter)
+	}
+
+	// ============================================================
+	// [NEW] Step 0: Comparison Query Detection (same as Chain mode)
+	// ============================================================
+	if c.comparisonService != nil {
+		c.comparisonService.SetDebugEmitter(emitter)
+
+		comparisonPending := c.sessionStore.GetPendingComparisonClarification(sessionID)
+
+		emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
+			StepID:    "agent_comparison_check",
+			StepName:  "ComparisonQueryDetection",
+			Component: "comparison",
+			Status:    apimodel.StatusStarted,
+			Input:     map[string]string{"query": truncateString(input, 100)},
+			Timestamp: time.Now().UnixMilli(),
+		})
+
+		result, err := c.comparisonService.ProcessComparisonQuery(ctx, input, comparisonPending)
+		if err == nil && result != nil && result.IsComparison {
+			emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
+				StepID:    "agent_comparison_check",
+				StepName:  "ComparisonQueryDetection",
+				Component: "comparison",
+				Status:    apimodel.StatusCompleted,
+				Output: map[string]interface{}{
+					"is_comparison":       result.IsComparison,
+					"needs_clarification": result.NeedsClarification,
+					"entity_count":        len(result.ResolvedEntities),
+				},
+				Timestamp: time.Now().UnixMilli(),
+			})
+
+			if result.NeedsClarification {
+				c.sessionStore.SetPendingComparisonClarification(sessionID, result.PendingState)
+				clarificationReq := c.convertComparisonClarification(result.ClarificationRequest)
+				log.Printf("[DEBUG] Agent: Emitting comparison clarification for entity=%s", result.ClarificationRequest.Entity)
+				emitter(apimodel.EventClarificationReq, clarificationReq)
+				return nil, fmt.Errorf("comparison_clarification_required")
+			}
+
+			// Comparison query resolved - use Chain mode for response
+			c.sessionStore.ClearPendingComparisonClarification(sessionID)
+			return c.streamComparisonResponse(ctx, session, input, result)
+		}
+
+		emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
+			StepID:    "agent_comparison_check",
+			StepName:  "ComparisonQueryDetection",
+			Component: "comparison",
+			Status:    apimodel.StatusCompleted,
+			Output:    map[string]interface{}{"is_comparison": false},
+			Timestamp: time.Now().UnixMilli(),
+		})
+	}
+
+	// ============================================================
+	// [NEW] Step 1: ClarificationOrchestrator Integration
+	// ============================================================
+	pending, _ := c.sessionStore.GetPendingClarification(sessionID)
+	orchestrator := c.GetClarificationOrchestrator(emitter)
+
+	var preRetrievedDocs []*schema.Document
+	var agentContext *agent.AgentContext
+
+	if orchestrator != nil && c.GetGraphRAGRetriever() != nil {
+		emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
+			StepID:    "agent_clarification_check",
+			StepName:  "ClarificationOrchestrator",
+			Component: "clarification",
+			Status:    apimodel.StatusStarted,
+			Input:     map[string]string{"query": truncateString(input, 100)},
+			Timestamp: time.Now().UnixMilli(),
+		})
+
+		decision, err := orchestrator.ProcessQuery(ctx, input, pending)
+		if err == nil {
+			emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
+				StepID:    "agent_clarification_check",
+				StepName:  "ClarificationOrchestrator",
+				Component: "clarification",
+				Status:    apimodel.StatusCompleted,
+				Output: map[string]interface{}{
+					"needs_clarification": decision.NeedsClarification,
+					"phase":               string(decision.Phase),
+					"source_node":         decision.SourceNodeName,
+					"documents_count":     len(decision.Documents),
+				},
+				Timestamp: time.Now().UnixMilli(),
+			})
+
+			if decision.NeedsClarification {
+				// Store pending clarification state
+				c.sessionStore.SetPendingClarification(sessionID, &apimodel.PendingClarification{
+					Phase:          decision.Phase,
+					OriginalQuery:  input,
+					SourceNodeUUID: decision.SourceNodeUUID,
+					SourceNodeName: decision.SourceNodeName,
+					CreatedAt:      time.Now(),
+				})
+
+				log.Printf("[DEBUG] Agent: Emitting clarification request for phase=%s", decision.Phase)
+				emitter(apimodel.EventClarificationReq, decision.ClarificationRequest)
+				return nil, fmt.Errorf("clarification_required")
+			}
+
+			// Extract verified context for Agent
+			agentContext = &agent.AgentContext{
+				SourceNodeUUID: decision.SourceNodeUUID,
+				SourceNodeName: decision.SourceNodeName,
+				IsHierarchical: decision.Analysis != nil && decision.Analysis.IsHierarchical,
+			}
+			if decision.Analysis != nil && len(decision.Analysis.Target.ExpectedLabels) > 0 {
+				agentContext.TargetLabels = decision.Analysis.Target.ExpectedLabels
+			}
+
+			// Use pre-retrieved documents if available
+			if len(decision.Documents) > 0 {
+				preRetrievedDocs = decision.Documents
+				log.Printf("[DEBUG] Agent: Using %d pre-retrieved documents from orchestrator", len(preRetrievedDocs))
+			}
+		} else {
+			emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
+				StepID:    "agent_clarification_check",
+				StepName:  "ClarificationOrchestrator",
+				Component: "clarification",
+				Status:    apimodel.StatusCompleted,
+				Output:    map[string]interface{}{"error": err.Error()},
+				Timestamp: time.Now().UnixMilli(),
+			})
+		}
+	}
+
+	// Clear any pending clarification since we're proceeding
+	c.sessionStore.ClearPendingClarification(sessionID)
+
+	// ============================================================
+	// [NEW] Step 2: Use Pre-Retrieved Documents (Skip Agent if available)
+	// ============================================================
+	if len(preRetrievedDocs) > 0 {
+		log.Printf("[DEBUG] Agent: Skipping agent, using %d pre-retrieved docs from orchestrator", len(preRetrievedDocs))
+
+		emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
+			StepID:    "agent_skip",
+			StepName:  "UsingPreRetrievedDocs",
+			Component: "agent",
+			Status:    apimodel.StatusCompleted,
+			Output: map[string]interface{}{
+				"reason":          "orchestrator_provided_docs",
+				"documents_count": len(preRetrievedDocs),
+			},
+			Timestamp: time.Now().UnixMilli(),
+		})
+
+		// Build context and stream response (same as Chain mode)
+		systemPrompt := c.buildRAGSystemPrompt(session.SystemPrompt, nil, preRetrievedDocs)
+		return c.chain.Stream(ctx, map[string]any{
+			"system_prompt": systemPrompt,
+			"history":       session.History,
+			"input":         input,
+		})
+	}
+
+	// ============================================================
+	// Step 3: Run Agent with Verified Context
+	// ============================================================
 	emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
 		StepID:    "agent_start",
 		StepName:  "GraphRAGAgent",
@@ -1102,19 +1468,30 @@ func (c *ChatService) ChatWithAgent(
 		Timestamp: time.Now().UnixMilli(),
 	})
 
-	// Build initial messages with history
+	// Build initial messages with filtered history
 	messages := make([]*schema.Message, 0, len(session.History)+1)
-	messages = append(messages, session.History...)
+	for _, msg := range session.History {
+		if msg.Role == schema.User || (msg.Role == schema.Assistant && len(msg.ToolCalls) == 0) {
+			messages = append(messages, msg)
+		}
+	}
 	messages = append(messages, schema.UserMessage(input))
 
 	// Create agent debug emitter wrapper
 	agentEmitter := func(event string, data interface{}) {
-		// Forward agent events to the main emitter
 		emitter(event, data)
 	}
 
-	// Run agent with debug emitter
-	streamReader, err := c.graphAgent.StreamWithDebug(ctx, messages, agentEmitter)
+	// Run agent with debug emitter and optional context
+	var streamReader *schema.StreamReader[*schema.Message]
+	if agentContext != nil && agentContext.SourceNodeUUID != "" {
+		log.Printf("[DEBUG] Agent: Running with verified context: sourceNode=%s, targetLabels=%v, isHierarchical=%v",
+			agentContext.SourceNodeName, agentContext.TargetLabels, agentContext.IsHierarchical)
+		streamReader, err = c.graphAgent.StreamWithDebugAndContext(ctx, messages, agentEmitter, agentContext)
+	} else {
+		streamReader, err = c.graphAgent.StreamWithDebug(ctx, messages, agentEmitter)
+	}
+
 	if err != nil {
 		emitter(apimodel.EventDebugStep, apimodel.DebugStepPayload{
 			StepID:    "agent_start",
@@ -1153,6 +1530,9 @@ func (c *ChatService) wrapAgentStream(
 		for {
 			msg, err := reader.Recv()
 			if err != nil {
+				if !errors.Is(err, io.EOF) {
+					log.Printf("[ERROR] Chat agent stream recv failed: %v", err)
+				}
 				return
 			}
 			writer.Send(msg, nil)

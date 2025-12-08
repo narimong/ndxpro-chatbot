@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -620,6 +621,9 @@ func (o *ClarificationOrchestrator) proceedWithRetrieval(
 		return nil, fmt.Errorf("retrieval failed: %w", err)
 	}
 
+	// Emit viz events for hierarchical nodes
+	o.emitVizForHierarchicalNodes(ctx, sourceNode.UUID, analysis.Target.ExpectedLabels)
+
 	return &ClarificationDecision{
 		NeedsClarification: false,
 		Documents:          docs,
@@ -627,6 +631,182 @@ func (o *ClarificationOrchestrator) proceedWithRetrieval(
 		SourceNodeName:     sourceNode.Name,
 		Analysis:           analysis,
 	}, nil
+}
+
+// emitVizForLabelListing emits viz events for label listing query results
+func (o *ClarificationOrchestrator) emitVizForLabelListing(ctx context.Context, selectedLabel string, docs []*schema.Document) {
+	if o.debugEmitter == nil {
+		return
+	}
+
+	startTime := time.Now()
+	var vizNodes []model.VizNode
+
+	// Emit viz:cypher for the label listing query
+	cypherViz := model.VizCypher{
+		QueryID:     uuid.New().String(),
+		Cypher:      fmt.Sprintf("MATCH (n:%s) RETURN n LIMIT 50", selectedLabel),
+		Params:      map[string]any{"label": selectedLabel},
+		ResultCount: len(docs),
+		Duration:    time.Since(startTime).Milliseconds(),
+		Source:      "clarification_orchestrator.LabelListing",
+		Timestamp:   time.Now().UnixMilli(),
+	}
+	log.Printf("[VIZ] Emitting viz:cypher (label listing): MATCH (n:%s)", selectedLabel)
+	o.debugEmitter(model.EventVizCypher, cypherViz)
+
+	// Emit viz:node for each document/node in results
+	for i, doc := range docs {
+		nodeUUID := ""
+		nodeName := ""
+		if doc.MetaData != nil {
+			if u, ok := doc.MetaData["uuid"].(string); ok {
+				nodeUUID = u
+			}
+			if n, ok := doc.MetaData["name"].(string); ok {
+				nodeName = n
+			}
+		}
+		if nodeUUID == "" {
+			nodeUUID = doc.ID
+		}
+		if nodeName == "" {
+			nodeName = fmt.Sprintf("%s_%d", selectedLabel, i+1)
+		}
+
+		vizNode := model.VizNode{
+			UUID:   nodeUUID,
+			Name:   nodeName,
+			Labels: []string{selectedLabel},
+			Depth:  0,
+			Source: "label_listing",
+		}
+		log.Printf("[VIZ] Emitting viz:node (label listing %d): %s", i+1, nodeName)
+		o.debugEmitter(model.EventVizNode, vizNode)
+		vizNodes = append(vizNodes, vizNode)
+	}
+
+	// Emit viz:complete
+	vizComplete := model.VizCompletePayload{
+		Nodes:         vizNodes,
+		Edges:         []model.VizEdge{},
+		CypherQueries: []model.VizCypher{cypherViz},
+		AnswerNodeIDs: func() []string {
+			ids := make([]string, 0, len(docs))
+			for _, doc := range docs {
+				if doc.MetaData != nil {
+					if u, ok := doc.MetaData["uuid"].(string); ok {
+						ids = append(ids, u)
+					}
+				}
+			}
+			return ids
+		}(),
+		Timestamp: time.Now().UnixMilli(),
+	}
+	log.Printf("[VIZ] Emitting viz:complete (label listing): %d nodes", len(vizNodes))
+	o.debugEmitter(model.EventVizComplete, vizComplete)
+}
+
+// emitVizForHierarchicalNodes emits viz events for hierarchical nodes retrieved from Neo4j
+func (o *ClarificationOrchestrator) emitVizForHierarchicalNodes(ctx context.Context, sourceUUID string, targetLabels []string) {
+	if o.debugEmitter == nil {
+		return
+	}
+
+	for _, targetLabel := range targetLabels {
+		// Get path to target
+		startTime := time.Now()
+		paths, err := o.neo4jClient.ShortestPathToLabel(ctx, sourceUUID, targetLabel, 6, 1)
+		pathDuration := time.Since(startTime)
+
+		// Emit viz:cypher for ShortestPathToLabel query
+		pathCypher := model.VizCypher{
+			QueryID:     uuid.New().String(),
+			Cypher:      fmt.Sprintf("MATCH path = shortestPath((start)-[*..6]->(end:%s)) WHERE start.uuid = $uuid RETURN path", targetLabel),
+			Params:      map[string]any{"uuid": sourceUUID, "targetLabel": targetLabel},
+			ResultCount: len(paths),
+			Duration:    pathDuration.Milliseconds(),
+			Source:      "clarification_orchestrator.ShortestPathToLabel",
+			Timestamp:   time.Now().UnixMilli(),
+		}
+		log.Printf("[VIZ] Emitting viz:cypher: ShortestPathToLabel (results=%d, duration=%dms)", len(paths), pathDuration.Milliseconds())
+		o.debugEmitter(model.EventVizCypher, pathCypher)
+
+		if err != nil || len(paths) == 0 {
+			continue
+		}
+
+		targetNodeUUID := paths[0].EndNodeUUID
+
+		// Get hierarchical children
+		startTime = time.Now()
+		root, children, err := o.neo4jClient.GetPerformanceScoreDetails(ctx, targetNodeUUID, 4)
+		hierDuration := time.Since(startTime)
+
+		// Emit viz:cypher for GetPerformanceScoreDetails query
+		hierCypher := model.VizCypher{
+			QueryID:     uuid.New().String(),
+			Cypher:      "MATCH (root)-[r:HAS_CHILD*0..4]->(child) WHERE root.uuid = $uuid RETURN root, child, r",
+			Params:      map[string]any{"uuid": targetNodeUUID, "maxDepth": 4},
+			ResultCount: len(children) + 1,
+			Duration:    hierDuration.Milliseconds(),
+			Source:      "clarification_orchestrator.GetPerformanceScoreDetails",
+			Timestamp:   time.Now().UnixMilli(),
+		}
+		log.Printf("[VIZ] Emitting viz:cypher: GetPerformanceScoreDetails (results=%d, duration=%dms)", len(children)+1, hierDuration.Milliseconds())
+		o.debugEmitter(model.EventVizCypher, hierCypher)
+
+		if err != nil {
+			continue
+		}
+
+		// Emit root node
+		if root != nil {
+			vizNode := model.VizNode{
+				UUID:   root.UUID,
+				Name:   root.Name,
+				Labels: root.Labels,
+				Score:  0,
+				Depth:  0,
+				Source: "hierarchical_retrieval",
+			}
+			log.Printf("[VIZ] Emitting viz:node (root): %s", vizNode.Name)
+			o.debugEmitter(model.EventVizNode, vizNode)
+		}
+
+		// Emit child nodes and edges
+		edgeCount := 0
+		for _, child := range children {
+			// Emit node
+			vizNode := model.VizNode{
+				UUID:       child.UUID,
+				Name:       child.Name,
+				Labels:     child.Labels,
+				Score:      0,
+				Depth:      child.Depth,
+				ParentUUID: child.ParentUUID,
+				Source:     "hierarchical_retrieval",
+			}
+			log.Printf("[VIZ] Emitting viz:node (child): %s depth=%d", vizNode.Name, vizNode.Depth)
+			o.debugEmitter(model.EventVizNode, vizNode)
+
+			// Emit edge (parent -> child relationship)
+			if child.ParentUUID != "" {
+				vizEdge := model.VizEdge{
+					ID:           uuid.New().String(),
+					FromUUID:     child.ParentUUID,
+					ToUUID:       child.UUID,
+					Relationship: "HAS_CHILD",
+					Direction:    "outgoing",
+				}
+				o.debugEmitter(model.EventVizEdge, vizEdge)
+				edgeCount++
+			}
+		}
+
+		log.Printf("[VIZ] Emitted %d viz:node events and %d viz:edge events for hierarchical data", len(children)+1, edgeCount)
+	}
 }
 
 // processPhase2 processes Phase 2 when we already have a source node from Phase 1
@@ -886,6 +1066,9 @@ func (o *ClarificationOrchestrator) processLabelListingPending(
 			return nil, fmt.Errorf("label listing retrieval failed: %w", err)
 		}
 
+		// Emit viz events for label listing results
+		o.emitVizForLabelListing(ctx, pending.SelectedLabel, docs)
+
 		return &ClarificationDecision{
 			NeedsClarification: false,
 			Documents:          docs,
@@ -969,6 +1152,9 @@ func (o *ClarificationOrchestrator) ResolveLabelListingClarification(
 	if err != nil {
 		return nil, fmt.Errorf("label listing retrieval failed: %w", err)
 	}
+
+	// Emit viz events for label listing results
+	o.emitVizForLabelListing(ctx, selectedLabel, docs)
 
 	return &ClarificationDecision{
 		NeedsClarification: false,
