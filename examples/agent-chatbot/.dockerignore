@@ -1,0 +1,25 @@
+# 환경 파일 (보안)
+.env
+
+# 기존 바이너리
+chatbot
+
+# 개발용 스크립트
+scripts/
+
+# Git
+.git/
+.gitignore
+
+# 문서
+*.md
+LICENSE
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 테스트 파일
+*_test.go
